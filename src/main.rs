@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::info;
@@ -35,6 +36,13 @@ struct RpcResponse {
 #[derive(Default)]
 struct AppState {
     stack: VecDeque<StackTask>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StackFile {
+    version: u64,
+    saved_at_ms: u128,
+    tasks: Vec<StackTask>,
 }
 
 fn now_unix_ms() -> u128 {
@@ -294,21 +302,60 @@ fn stack_path_from_args(args: &Value) -> String {
         .to_string()
 }
 
+fn stack_file_from_content(content: &str) -> Result<StackFile, String> {
+    let stack_file: StackFile =
+        serde_json::from_str(content).map_err(|err| format!("invalid stack json: {err}"))?;
+
+    if stack_file.version != 1 {
+        return Err(format!(
+            "unsupported stack file version: {} (expected 1)",
+            stack_file.version
+        ));
+    }
+
+    Ok(stack_file)
+}
+
+fn parent_dir(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(parent)
+}
+
 async fn save_stack(state: &AppState, args: &Value) -> Value {
     let path = stack_path_from_args(args);
-    let payload = json!({
-      "version": 1,
-      "saved_at_ms": now_unix_ms(),
-      "tasks": state.stack
-    });
+    let path_buf = PathBuf::from(&path);
 
-    match serde_json::to_vec_pretty(&payload) {
-        Ok(bytes) => match fs::write(&path, bytes).await {
-            Ok(_) => json!({"ok":true,"path":path,"saved":state.stack.len()}),
-            Err(err) => json!({"ok":false,"error":format!("save failed: {err}")}),
-        },
-        Err(err) => json!({"ok":false,"error":format!("serialize failed: {err}")}),
+    if let Some(parent) = parent_dir(&path_buf) {
+        if let Err(err) = fs::create_dir_all(parent).await {
+            return json!({"ok":false,"error":format!("save failed creating parent dir: {err}")});
+        }
     }
+
+    let payload = StackFile {
+        version: 1,
+        saved_at_ms: now_unix_ms(),
+        tasks: state.stack.iter().cloned().collect(),
+    };
+
+    let bytes = match serde_json::to_vec_pretty(&payload) {
+        Ok(bytes) => bytes,
+        Err(err) => return json!({"ok":false,"error":format!("serialize failed: {err}")}),
+    };
+
+    let tmp_path = format!("{path}.tmp-{}", Uuid::new_v4());
+    if let Err(err) = fs::write(&tmp_path, bytes).await {
+        return json!({"ok":false,"error":format!("save failed writing temp file: {err}")});
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, &path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return json!({"ok":false,"error":format!("save failed replacing target file: {err}")});
+    }
+
+    json!({"ok":true,"path":path,"saved":state.stack.len()})
 }
 
 async fn load_stack(state: &mut AppState, args: &Value) -> Value {
@@ -318,20 +365,12 @@ async fn load_stack(state: &mut AppState, args: &Value) -> Value {
         Err(err) => return json!({"ok":false,"error":format!("load failed: {err}")}),
     };
 
-    let parsed: Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(err) => return json!({"ok":false,"error":format!("invalid stack json: {err}")}),
+    let stack_file = match stack_file_from_content(&content) {
+        Ok(file) => file,
+        Err(err) => return json!({"ok":false,"error":err}),
     };
 
-    let tasks_val = parsed.get("tasks").cloned().unwrap_or_else(|| json!([]));
-    let tasks: Vec<StackTask> = match serde_json::from_value(tasks_val) {
-        Ok(t) => t,
-        Err(err) => {
-            return json!({"ok":false,"error":format!("invalid task list in stack file: {err}")})
-        }
-    };
-
-    state.stack = VecDeque::from(tasks);
+    state.stack = VecDeque::from(stack_file.tasks);
     json!({"ok":true,"path":path,"loaded":state.stack.len(),"stack_depth":state.stack.len()})
 }
 
@@ -346,6 +385,7 @@ async fn write_response(stdout: &mut io::Stdout, response: RpcResponse) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn task_with_times(delay_ms: u64, enqueued_at_ms: u128) -> StackTask {
         StackTask {
@@ -427,5 +467,37 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .contains("limit must be a non-negative integer"));
+    }
+
+    #[test]
+    fn stack_file_parser_rejects_unsupported_version() {
+        let content = json!({
+            "version": 99,
+            "saved_at_ms": 123,
+            "tasks": []
+        })
+        .to_string();
+
+        let err = stack_file_from_content(&content).unwrap_err();
+        assert!(err.contains("unsupported stack file version"));
+    }
+
+    #[tokio::test]
+    async fn save_stack_creates_parent_directory_and_is_loadable() {
+        let tmp = tempdir().expect("temp dir");
+        let nested_path = tmp.path().join("nested").join("stack.json");
+        let nested_path_str = nested_path.to_string_lossy().to_string();
+
+        let mut state = AppState::default();
+        state.stack.push_back(task_with_times(500, now_unix_ms()));
+
+        let save_result = save_stack(&state, &json!({"path": nested_path_str})).await;
+        assert_eq!(save_result.get("ok").and_then(Value::as_bool), Some(true));
+        assert!(nested_path.exists());
+
+        let mut loaded_state = AppState::default();
+        let load_result = load_stack(&mut loaded_state, &json!({"path": nested_path})).await;
+        assert_eq!(load_result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(loaded_state.stack.len(), 1);
     }
 }

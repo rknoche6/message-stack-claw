@@ -88,6 +88,8 @@ Batch-run due tasks, max 10 at a time, including tasks due within 250ms:
 
 - Stack is in-memory by default, but you can persist/restore via `stack_save` and `stack_load`.
 - Default persistence path is `.message-stack-claw.stack.json` (override with `path`).
+- `stack_save` writes atomically (temp file + rename) and creates parent directories when needed.
+- `stack_load` validates the persisted file format version and fails fast on incompatible versions.
 - `stack_run_next` waits only the **remaining** delay (delay counted from enqueue time).
 - `stack_run_due` executes due tasks without waiting and supports optional batching controls:
   - `limit`: maximum number of tasks to execute in one call
