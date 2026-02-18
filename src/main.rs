@@ -41,6 +41,10 @@ struct AppState {
 
 const MAX_STACK_DEPTH: usize = 10_000;
 const MAX_BATCH_ITEMS: usize = 1_000;
+const MAX_FUNCTION_NAME_LEN: usize = 256;
+const MAX_NOTE_LEN: usize = 4_096;
+const MAX_DEDUPE_KEY_LEN: usize = 512;
+const MAX_ARGS_JSON_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StackFile {
@@ -235,6 +239,57 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
     }
 }
 
+fn json_size_bytes(value: &Value) -> Result<usize, String> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .map_err(|err| format!("failed to serialize args: {err}"))
+}
+
+fn validate_task_fields(
+    function_name: &str,
+    note: Option<&str>,
+    dedupe_key: Option<&str>,
+    args_value: &Value,
+) -> Result<(), String> {
+    if function_name.is_empty() {
+        return Err("function_name is required".to_string());
+    }
+
+    if function_name.len() > MAX_FUNCTION_NAME_LEN {
+        return Err(format!(
+            "function_name too long: {} bytes (max {MAX_FUNCTION_NAME_LEN})",
+            function_name.len()
+        ));
+    }
+
+    if let Some(note) = note {
+        if note.len() > MAX_NOTE_LEN {
+            return Err(format!(
+                "note too long: {} bytes (max {MAX_NOTE_LEN})",
+                note.len()
+            ));
+        }
+    }
+
+    if let Some(dedupe_key) = dedupe_key {
+        if dedupe_key.len() > MAX_DEDUPE_KEY_LEN {
+            return Err(format!(
+                "dedupe_key too long: {} bytes (max {MAX_DEDUPE_KEY_LEN})",
+                dedupe_key.len()
+            ));
+        }
+    }
+
+    let args_size = json_size_bytes(args_value)?;
+    if args_size > MAX_ARGS_JSON_BYTES {
+        return Err(format!(
+            "args payload too large: {args_size} bytes (max {MAX_ARGS_JSON_BYTES})"
+        ));
+    }
+
+    Ok(())
+}
+
 fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
     let function_name = args
         .get("function_name")
@@ -279,10 +334,19 @@ fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
         }
     };
 
+    let args_value = args.get("args").cloned().unwrap_or_else(|| json!({}));
+
+    validate_task_fields(
+        &function_name,
+        note.as_deref(),
+        dedupe_key.as_deref(),
+        &args_value,
+    )?;
+
     Ok(StackTask {
         id: Uuid::new_v4(),
         function_name,
-        args: args.get("args").cloned().unwrap_or_else(|| json!({})),
+        args: args_value,
         delay_ms,
         enqueued_at_ms: now_unix_ms(),
         note,
@@ -726,9 +790,14 @@ fn stack_file_from_content(content: &str) -> Result<StackFile, String> {
 
 fn validate_loaded_tasks(tasks: &[StackTask]) -> Result<(), String> {
     for (idx, task) in tasks.iter().enumerate() {
-        if task.function_name.trim().is_empty() {
-            return Err(format!("tasks[{idx}] has empty function_name"));
-        }
+        let function_name = task.function_name.trim();
+        validate_task_fields(
+            function_name,
+            task.note.as_deref(),
+            task.dedupe_key.as_deref(),
+            &task.args,
+        )
+        .map_err(|err| format!("tasks[{idx}] invalid: {err}"))?;
     }
     Ok(())
 }
@@ -1314,8 +1383,74 @@ mod tests {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .contains("empty function_name"));
+            .contains("function_name is required"));
         assert!(state.stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stack_push_rejects_oversized_args_payload() {
+        let mut state = AppState::default();
+        let oversized = "x".repeat(MAX_ARGS_JSON_BYTES + 1);
+
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {
+                    "function_name": "message.send",
+                    "args": {"blob": oversized}
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("args payload too large"));
+    }
+
+    #[tokio::test]
+    async fn load_stack_rejects_oversized_args_payload() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("invalid-stack.json");
+
+        let oversized = "x".repeat(MAX_ARGS_JSON_BYTES + 1);
+        let file_payload = StackFile {
+            version: 1,
+            saved_at_ms: now_unix_ms(),
+            tasks: vec![StackTask {
+                id: Uuid::new_v4(),
+                function_name: "message.send".to_string(),
+                args: json!({"blob": oversized}),
+                delay_ms: 0,
+                enqueued_at_ms: now_unix_ms(),
+                note: None,
+                dedupe_key: None,
+            }],
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&file_payload).expect("serialize"),
+        )
+        .await
+        .expect("write stack file");
+
+        let mut state = AppState::default();
+        let result = load_stack(
+            &mut state,
+            &json!({"path": path.to_string_lossy().to_string()}),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("args payload too large"));
     }
 
     #[test]
