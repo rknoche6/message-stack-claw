@@ -21,6 +21,8 @@ Examples:
 - `stack_run_due()`
 - `stack_run_all()`
 - `stack_clear()`
+- `stack_save(path?)`
+- `stack_load(path?)`
 
 ## Protocol
 
@@ -71,8 +73,8 @@ Run next queued task:
 
 ## Notes
 
-- The stack is in-memory for now (resets when process restarts).
+- Stack is in-memory by default, but you can persist/restore via `stack_save` and `stack_load`.
+- Default persistence path is `.message-stack-claw.stack.json` (override with `path`).
 - `stack_run_next` waits only the **remaining** delay (delay counted from enqueue time).
 - `stack_run_due` executes all tasks that are due right now without waiting; useful for batch drains in heartbeat/deferred loops.
 - `stack_list` includes `remaining_delay_ms` for each task.
-- If you need persistence, add a file-backed store in a follow-up.

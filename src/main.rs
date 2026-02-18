@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use tokio::fs;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::info;
 use uuid::Uuid;
@@ -108,7 +109,9 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
             {"name":"stack_run_due","description":"Run all currently due calls without waiting (batched)"},
             {"name":"stack_run_all","description":"Run queued calls from top to bottom"},
-            {"name":"stack_clear","description":"Clear all queued calls"}
+            {"name":"stack_clear","description":"Clear all queued calls"},
+            {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
+            {"name":"stack_load","description":"Load stack from disk and replace current stack","input_schema":{"path":"string?"}}
           ]
         }),
         "tools/call" => call_tool(state, &req.params).await,
@@ -183,6 +186,8 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
             state.stack.clear();
             json!({"ok":true,"cleared":cleared})
         }
+        "stack_save" => save_stack(state, &args).await,
+        "stack_load" => load_stack(state, &args).await,
         _ => json!({"ok":false,"error":format!("unknown tool: {tool}")}),
     }
 }
@@ -246,6 +251,54 @@ async fn run_due(state: &mut AppState) -> Value {
         "stack_depth": state.stack.len(),
         "now_ms": now_ms
     })
+}
+
+fn stack_path_from_args(args: &Value) -> String {
+    args.get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(".message-stack-claw.stack.json")
+        .to_string()
+}
+
+async fn save_stack(state: &AppState, args: &Value) -> Value {
+    let path = stack_path_from_args(args);
+    let payload = json!({
+      "version": 1,
+      "saved_at_ms": now_unix_ms(),
+      "tasks": state.stack
+    });
+
+    match serde_json::to_vec_pretty(&payload) {
+        Ok(bytes) => match fs::write(&path, bytes).await {
+            Ok(_) => json!({"ok":true,"path":path,"saved":state.stack.len()}),
+            Err(err) => json!({"ok":false,"error":format!("save failed: {err}")}),
+        },
+        Err(err) => json!({"ok":false,"error":format!("serialize failed: {err}")}),
+    }
+}
+
+async fn load_stack(state: &mut AppState, args: &Value) -> Value {
+    let path = stack_path_from_args(args);
+    let content = match fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(err) => return json!({"ok":false,"error":format!("load failed: {err}")}),
+    };
+
+    let parsed: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(err) => return json!({"ok":false,"error":format!("invalid stack json: {err}")}),
+    };
+
+    let tasks_val = parsed.get("tasks").cloned().unwrap_or_else(|| json!([]));
+    let tasks: Vec<StackTask> = match serde_json::from_value(tasks_val) {
+        Ok(t) => t,
+        Err(err) => {
+            return json!({"ok":false,"error":format!("invalid task list in stack file: {err}")})
+        }
+    };
+
+    state.stack = VecDeque::from(tasks);
+    json!({"ok":true,"path":path,"loaded":state.stack.len(),"stack_depth":state.stack.len()})
 }
 
 async fn write_response(stdout: &mut io::Stdout, response: RpcResponse) -> Result<()> {
