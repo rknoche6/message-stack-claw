@@ -120,7 +120,7 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_run_all","description":"Run queued calls from top to bottom"},
             {"name":"stack_clear","description":"Clear all queued calls"},
             {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
-            {"name":"stack_load","description":"Load stack from disk and replace current stack","input_schema":{"path":"string?"}}
+            {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)"}}
           ]
         }),
         "tools/call" => call_tool(state, &req.params).await,
@@ -371,6 +371,15 @@ fn stack_file_from_content(content: &str) -> Result<StackFile, String> {
     Ok(stack_file)
 }
 
+fn validate_loaded_tasks(tasks: &[StackTask]) -> Result<(), String> {
+    for (idx, task) in tasks.iter().enumerate() {
+        if task.function_name.trim().is_empty() {
+            return Err(format!("tasks[{idx}] has empty function_name"));
+        }
+    }
+    Ok(())
+}
+
 fn parent_dir(path: &Path) -> Option<&Path> {
     let parent = path.parent()?;
     if parent.as_os_str().is_empty() {
@@ -425,8 +434,50 @@ async fn load_stack(state: &mut AppState, args: &Value) -> Value {
         Err(err) => return json!({"ok":false,"error":err}),
     };
 
-    state.stack = VecDeque::from(stack_file.tasks);
-    json!({"ok":true,"path":path,"loaded":state.stack.len(),"stack_depth":state.stack.len()})
+    if let Err(err) = validate_loaded_tasks(&stack_file.tasks) {
+        return json!({"ok":false,"error":format!("invalid task payload: {err}")});
+    }
+
+    let mode = args
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("replace");
+
+    match mode {
+        "replace" => {
+            state.stack = VecDeque::from(stack_file.tasks);
+            json!({"ok":true,"path":path,"loaded":state.stack.len(),"stack_depth":state.stack.len(),"mode":"replace"})
+        }
+        "append" => {
+            let dedupe_ids = args
+                .get("dedupe_ids")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+
+            let before = state.stack.len();
+            let mut skipped = 0usize;
+
+            for task in stack_file.tasks {
+                if dedupe_ids && state.stack.iter().any(|existing| existing.id == task.id) {
+                    skipped += 1;
+                    continue;
+                }
+                state.stack.push_back(task);
+            }
+
+            let loaded = state.stack.len().saturating_sub(before);
+            json!({
+                "ok": true,
+                "path": path,
+                "mode": "append",
+                "loaded": loaded,
+                "skipped": skipped,
+                "dedupe_ids": dedupe_ids,
+                "stack_depth": state.stack.len()
+            })
+        }
+        _ => json!({"ok":false,"error":"mode must be one of: replace, append"}),
+    }
 }
 
 async fn write_response(stdout: &mut io::Stdout, response: RpcResponse) -> Result<()> {
@@ -591,5 +642,104 @@ mod tests {
         let load_result = load_stack(&mut loaded_state, &json!({"path": nested_path})).await;
         assert_eq!(load_result.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(loaded_state.stack.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_stack_append_mode_dedupes_ids_by_default() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("stack.json");
+
+        let shared_id = Uuid::new_v4();
+        let existing = StackTask {
+            id: shared_id,
+            function_name: "message.send".to_string(),
+            args: json!({"text":"existing"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+        };
+        let duplicate = StackTask {
+            id: shared_id,
+            function_name: "message.send".to_string(),
+            args: json!({"text":"dup"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+        };
+        let unique = StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"unique"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+        };
+
+        let file_payload = StackFile {
+            version: 1,
+            saved_at_ms: now_unix_ms(),
+            tasks: vec![duplicate, unique],
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&file_payload).expect("serialize"),
+        )
+        .await
+        .expect("write stack file");
+
+        let mut state = AppState {
+            stack: VecDeque::from(vec![existing]),
+        };
+
+        let result = load_stack(
+            &mut state,
+            &json!({"path": path.to_string_lossy().to_string(), "mode": "append"}),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("loaded").and_then(Value::as_u64), Some(1));
+        assert_eq!(result.get("skipped").and_then(Value::as_u64), Some(1));
+        assert_eq!(state.stack.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn load_stack_rejects_empty_function_name() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("invalid-stack.json");
+
+        let file_payload = StackFile {
+            version: 1,
+            saved_at_ms: now_unix_ms(),
+            tasks: vec![StackTask {
+                id: Uuid::new_v4(),
+                function_name: "   ".to_string(),
+                args: json!({}),
+                delay_ms: 0,
+                enqueued_at_ms: now_unix_ms(),
+                note: None,
+            }],
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&file_payload).expect("serialize"),
+        )
+        .await
+        .expect("write stack file");
+
+        let mut state = AppState::default();
+        let result = load_stack(
+            &mut state,
+            &json!({"path": path.to_string_lossy().to_string()}),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("empty function_name"));
+        assert!(state.stack.is_empty());
     }
 }

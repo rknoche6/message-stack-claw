@@ -23,7 +23,7 @@ Examples:
 - `stack_run_all()`
 - `stack_clear()`
 - `stack_save(path?)`
-- `stack_load(path?)`
+- `stack_load(path?, mode?, dedupe_ids?)`
 
 ## Protocol
 
@@ -103,12 +103,30 @@ Batch-run due tasks, max 10 at a time, including tasks due within 250ms:
 }
 ```
 
+Append from a saved stack file while skipping duplicate task IDs:
+
+```json
+{
+  "id": 5,
+  "method": "tools/call",
+  "params": {
+    "name": "stack_load",
+    "arguments": { "path": ".message-stack-claw.stack.json", "mode": "append", "dedupe_ids": true }
+  }
+}
+```
+
 ## Notes
 
 - Stack is in-memory by default, but you can persist/restore via `stack_save` and `stack_load`.
 - Default persistence path is `.message-stack-claw.stack.json` (override with `path`).
 - `stack_save` writes atomically (temp file + rename) and creates parent directories when needed.
 - `stack_load` validates the persisted file format version and fails fast on incompatible versions.
+- `stack_load` also validates task payloads and rejects invalid entries (for example empty `function_name`).
+- `stack_load` supports `mode`:
+  - `replace` (default): replace in-memory stack with file contents
+  - `append`: append file contents to current stack
+- In `append` mode, `dedupe_ids` defaults to `true` to avoid duplicate task IDs when reloading snapshots.
 - `stack_run_next` waits only the **remaining** delay (delay counted from enqueue time).
 - `stack_push_batch` validates the full batch first and only enqueues when all items are valid (prevents partial queue updates).
 - `stack_run_due` executes due tasks without waiting and supports optional batching controls:
