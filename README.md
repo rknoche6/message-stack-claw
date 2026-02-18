@@ -21,6 +21,7 @@ Examples:
 - `stack_run_next()`
 - `stack_run_due(limit?, grace_ms?)`
 - `stack_run_all()`
+- `stack_cancel(id?, dedupe_key?, function_name?, limit?)`
 - `stack_clear()`
 - `stack_save(path?)`
 - `stack_load(path?, mode?, dedupe_ids?, pause_during_downtime?)`
@@ -122,6 +123,19 @@ Batch-run due tasks, max 10 at a time, including tasks due within 250ms:
 }
 ```
 
+Cancel a queued task by dedupe key (or by `id` / `function_name`):
+
+```json
+{
+  "id": 41,
+  "method": "tools/call",
+  "params": {
+    "name": "stack_cancel",
+    "arguments": { "dedupe_key": "welcome-message-user-42", "limit": 1 }
+  }
+}
+```
+
 Append from a saved stack file while skipping duplicate task IDs:
 
 ```json
@@ -175,4 +189,5 @@ Restore from disk while preserving remaining delay windows (ignore downtime betw
 - `stack_run_due` executes due tasks without waiting and supports optional batching controls:
   - `limit`: maximum number of tasks to execute in one call
   - `grace_ms`: include near-due tasks whose remaining delay is within this window
+- `stack_cancel` removes queued tasks safely by selector (`id`, `dedupe_key`, or `function_name`) with optional `limit` to avoid over-canceling.
 - `stack_list` includes `remaining_delay_ms` for each task.

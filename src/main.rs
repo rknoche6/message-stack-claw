@@ -122,6 +122,7 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
             {"name":"stack_run_due","description":"Run due calls in batch without waiting","input_schema":{"limit":"number?","grace_ms":"number?"}},
             {"name":"stack_run_all","description":"Run queued calls from top to bottom"},
+            {"name":"stack_cancel","description":"Cancel queued calls by id, dedupe_key, or function_name","input_schema":{"id":"uuid?","dedupe_key":"string?","function_name":"string?","limit":"number? (default all matches)"}},
             {"name":"stack_clear","description":"Clear all queued calls"},
             {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
             {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)","pause_during_downtime":"boolean? (default false; preserves remaining delays across save→load downtime)"}}
@@ -222,6 +223,7 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
             }
             json!({"ok":true,"results":results})
         }
+        "stack_cancel" => cancel_tasks(state, &args),
         "stack_clear" => {
             let cleared = state.stack.len();
             state.stack.clear();
@@ -590,6 +592,114 @@ async fn run_due(state: &mut AppState, args: &Value) -> Value {
         "grace_ms": grace_ms,
         "limit": limit,
         "selected": selected
+    })
+}
+
+fn cancel_tasks(state: &mut AppState, args: &Value) -> Value {
+    let id = match args.get("id") {
+        None => None,
+        Some(v) => {
+            let raw = match v.as_str() {
+                Some(raw) => raw,
+                None => return json!({"ok":false,"error":"id must be a uuid string"}),
+            };
+
+            match Uuid::parse_str(raw) {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    return json!({"ok":false,"error":format!("invalid id: {err}")});
+                }
+            }
+        }
+    };
+
+    let dedupe_key = match args.get("dedupe_key") {
+        None => None,
+        Some(v) => {
+            let key = match v.as_str() {
+                Some(s) => s.trim(),
+                None => return json!({"ok":false,"error":"dedupe_key must be a string"}),
+            };
+
+            if key.is_empty() {
+                return json!({"ok":false,"error":"dedupe_key must not be empty"});
+            }
+
+            Some(key.to_string())
+        }
+    };
+
+    let function_name = match args.get("function_name") {
+        None => None,
+        Some(v) => {
+            let name = match v.as_str() {
+                Some(s) => s.trim(),
+                None => return json!({"ok":false,"error":"function_name must be a string"}),
+            };
+
+            if name.is_empty() {
+                return json!({"ok":false,"error":"function_name must not be empty"});
+            }
+
+            Some(name.to_string())
+        }
+    };
+
+    if id.is_none() && dedupe_key.is_none() && function_name.is_none() {
+        return json!({
+            "ok":false,
+            "error":"one selector is required: id, dedupe_key, or function_name"
+        });
+    }
+
+    let limit = match arg_u64(args, "limit") {
+        Ok(v) => v,
+        Err(err) => return json!({"ok":false,"error":err}),
+    };
+
+    if limit == Some(0) {
+        return json!({"ok":true,"canceled":0,"tasks":[],"stack_depth":state.stack.len(),"reason":"limit is 0"});
+    }
+
+    let mut canceled = Vec::new();
+    let mut remaining = VecDeque::with_capacity(state.stack.len());
+
+    for task in state.stack.drain(..) {
+        let matches_id = id.map(|value| task.id == value).unwrap_or(false);
+        let matches_dedupe = dedupe_key
+            .as_deref()
+            .map(|value| task.dedupe_key.as_deref() == Some(value))
+            .unwrap_or(false);
+        let matches_function = function_name
+            .as_deref()
+            .map(|value| task.function_name == value)
+            .unwrap_or(false);
+
+        let is_match = matches_id || matches_dedupe || matches_function;
+        let under_limit = limit
+            .map(|max| (canceled.len() as u64) < max)
+            .unwrap_or(true);
+
+        if is_match && under_limit {
+            canceled.push(task);
+        } else {
+            remaining.push_back(task);
+        }
+    }
+
+    state.stack = remaining;
+
+    json!({
+        "ok": true,
+        "canceled": canceled.len(),
+        "tasks": canceled,
+        "selectors": {
+            "id": id,
+            "dedupe_key": dedupe_key,
+            "function_name": function_name
+        },
+        "limit": limit,
+        "stack_depth": state.stack.len()
     })
 }
 
@@ -1308,5 +1418,83 @@ mod tests {
 
         let task = state.stack.back().expect("task");
         assert_eq!(task.args.get("text").and_then(Value::as_str), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn stack_cancel_removes_matching_dedupe_key() {
+        let mut state = AppState::default();
+        let t1 = StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"a"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+            dedupe_key: Some("k-1".to_string()),
+        };
+        let t2 = StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"b"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+            dedupe_key: Some("k-2".to_string()),
+        };
+        state.stack.push_back(t1);
+        state.stack.push_back(t2);
+
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name":"stack_cancel",
+                "arguments":{"dedupe_key":"k-1"}
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("canceled").and_then(Value::as_u64), Some(1));
+        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.stack[0].dedupe_key.as_deref(), Some("k-2"));
+    }
+
+    #[tokio::test]
+    async fn stack_cancel_respects_limit() {
+        let mut state = AppState::default();
+        state.stack.push_back(task_with_times(0, now_unix_ms()));
+        state.stack.push_back(task_with_times(0, now_unix_ms()));
+        state.stack.push_back(task_with_times(0, now_unix_ms()));
+
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name":"stack_cancel",
+                "arguments":{"function_name":"message.send","limit":2}
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("canceled").and_then(Value::as_u64), Some(2));
+        assert_eq!(state.stack.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stack_cancel_requires_selector() {
+        let mut state = AppState::default();
+        state.stack.push_back(task_with_times(0, now_unix_ms()));
+
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name":"stack_cancel",
+                "arguments":{}
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(state.stack.len(), 1);
     }
 }
