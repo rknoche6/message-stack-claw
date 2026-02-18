@@ -8,6 +8,7 @@ For OpenClaw workflows, you often want to queue actions and execute them later i
 This server gives you a simple **LIFO stack** with per-task delay.
 
 Examples:
+
 - queue follow-up notifications and execute them with spacing
 - stage retries/backoff actions as deferred calls
 - queue tool calls during one turn and drain them in a later turn
@@ -17,12 +18,14 @@ Examples:
 - `stack_push(function_name, args, delay_ms, note?)`
 - `stack_list()`
 - `stack_run_next()`
+- `stack_run_due()`
 - `stack_run_all()`
 - `stack_clear()`
 
 ## Protocol
 
 JSON-RPC-like over stdio:
+
 - `tools/list`
 - `tools/call`
 
@@ -39,23 +42,37 @@ cargo run
 List tools:
 
 ```json
-{"id":1,"method":"tools/list"}
+{ "id": 1, "method": "tools/list" }
 ```
 
 Push a task:
 
 ```json
-{"id":2,"method":"tools/call","params":{"name":"stack_push","arguments":{"function_name":"message.send","args":{"target":"ops","text":"Ping"},"delay_ms":1500,"note":"retry #1"}}}
+{
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "stack_push",
+    "arguments": {
+      "function_name": "message.send",
+      "args": { "target": "ops", "text": "Ping" },
+      "delay_ms": 1500,
+      "note": "retry #1"
+    }
+  }
+}
 ```
 
 Run next queued task:
 
 ```json
-{"id":3,"method":"tools/call","params":{"name":"stack_run_next","arguments":{}}}
+{ "id": 3, "method": "tools/call", "params": { "name": "stack_run_next", "arguments": {} } }
 ```
 
 ## Notes
 
 - The stack is in-memory for now (resets when process restarts).
-- `stack_run_next` waits `delay_ms` before returning execution payload.
+- `stack_run_next` waits only the **remaining** delay (delay counted from enqueue time).
+- `stack_run_due` executes all tasks that are due right now without waiting; useful for batch drains in heartbeat/deferred loops.
+- `stack_list` includes `remaining_delay_ms` for each task.
 - If you need persistence, add a file-backed store in a follow-up.

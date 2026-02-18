@@ -12,6 +12,7 @@ struct StackTask {
     function_name: String,
     args: Value,
     delay_ms: u64,
+    enqueued_at_ms: u128,
     note: Option<String>,
 }
 
@@ -33,6 +34,18 @@ struct RpcResponse {
 #[derive(Default)]
 struct AppState {
     stack: VecDeque<StackTask>,
+}
+
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn remaining_delay_ms(task: &StackTask, now_ms: u128) -> u64 {
+    let elapsed = now_ms.saturating_sub(task.enqueued_at_ms);
+    task.delay_ms.saturating_sub(elapsed as u64)
 }
 
 #[tokio::main]
@@ -92,7 +105,8 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
           "tools": [
             {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?"}},
             {"name":"stack_list","description":"List queued deferred calls"},
-            {"name":"stack_run_next","description":"Pop top call, wait delay_ms, then execute/simulate"},
+            {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
+            {"name":"stack_run_due","description":"Run all currently due calls without waiting (batched)"},
             {"name":"stack_run_all","description":"Run queued calls from top to bottom"},
             {"name":"stack_clear","description":"Clear all queued calls"}
           ]
@@ -127,6 +141,7 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
                 function_name,
                 args: args.get("args").cloned().unwrap_or_else(|| json!({})),
                 delay_ms: args.get("delay_ms").and_then(Value::as_u64).unwrap_or(0),
+                enqueued_at_ms: now_unix_ms(),
                 note: args
                     .get("note")
                     .and_then(Value::as_str)
@@ -135,8 +150,27 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
             state.stack.push_back(task.clone());
             json!({"ok":true,"task":task,"stack_depth":state.stack.len()})
         }
-        "stack_list" => json!({"ok":true,"stack_depth":state.stack.len(),"tasks":state.stack}),
+        "stack_list" => {
+            let now_ms = now_unix_ms();
+            let tasks: Vec<Value> = state
+                .stack
+                .iter()
+                .map(|task| {
+                    json!({
+                        "id": task.id,
+                        "function_name": task.function_name,
+                        "args": task.args,
+                        "note": task.note,
+                        "delay_ms": task.delay_ms,
+                        "enqueued_at_ms": task.enqueued_at_ms,
+                        "remaining_delay_ms": remaining_delay_ms(task, now_ms)
+                    })
+                })
+                .collect();
+            json!({"ok":true,"stack_depth":state.stack.len(),"tasks":tasks,"now_ms":now_ms})
+        }
         "stack_run_next" => run_next(state).await,
+        "stack_run_due" => run_due(state).await,
         "stack_run_all" => {
             let mut results = vec![];
             while !state.stack.is_empty() {
@@ -153,28 +187,64 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
     }
 }
 
+fn executed_payload(task: StackTask, status: &str) -> Value {
+    json!({
+      "id": task.id,
+      "function_name": task.function_name,
+      "args": task.args,
+      "note": task.note,
+      "delay_ms": task.delay_ms,
+      "enqueued_at_ms": task.enqueued_at_ms,
+      "status": status
+    })
+}
+
 async fn run_next(state: &mut AppState) -> Value {
     let Some(task) = state.stack.pop_back() else {
         return json!({"ok":false,"error":"stack is empty"});
     };
 
-    if task.delay_ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(task.delay_ms)).await;
+    let remaining_ms = remaining_delay_ms(&task, now_unix_ms());
+    if remaining_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
     }
 
-    // Useful default behavior for OpenClaw orchestrations:
-    // return a normalized execution payload that another agent/tool can consume.
     json!({
       "ok": true,
-      "executed": {
-        "id": task.id,
-        "function_name": task.function_name,
-        "args": task.args,
-        "note": task.note,
-        "delay_ms": task.delay_ms,
-        "status": "executed"
-      },
+      "waited_ms": remaining_ms,
+      "executed": executed_payload(task, "executed"),
       "stack_depth": state.stack.len()
+    })
+}
+
+async fn run_due(state: &mut AppState) -> Value {
+    if state.stack.is_empty() {
+        return json!({"ok":true,"ran":0,"results":[],"stack_depth":0});
+    }
+
+    let now_ms = now_unix_ms();
+    let mut due_indices = Vec::new();
+    for idx in (0..state.stack.len()).rev() {
+        if let Some(task) = state.stack.get(idx) {
+            if remaining_delay_ms(task, now_ms) == 0 {
+                due_indices.push(idx);
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity(due_indices.len());
+    for idx in due_indices {
+        if let Some(task) = state.stack.remove(idx) {
+            results.push(executed_payload(task, "executed_due"));
+        }
+    }
+
+    json!({
+        "ok": true,
+        "ran": results.len(),
+        "results": results,
+        "stack_depth": state.stack.len(),
+        "now_ms": now_ms
     })
 }
 
@@ -184,4 +254,49 @@ async fn write_response(stdout: &mut io::Stdout, response: RpcResponse) -> Resul
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_with_times(delay_ms: u64, enqueued_at_ms: u128) -> StackTask {
+        StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"hi"}),
+            delay_ms,
+            enqueued_at_ms,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn remaining_delay_is_reduced_by_elapsed_time() {
+        let task = task_with_times(5_000, 10_000);
+        assert_eq!(remaining_delay_ms(&task, 12_000), 3_000);
+    }
+
+    #[test]
+    fn remaining_delay_saturates_at_zero() {
+        let task = task_with_times(1_000, 10_000);
+        assert_eq!(remaining_delay_ms(&task, 20_000), 0);
+    }
+
+    #[tokio::test]
+    async fn run_due_executes_only_due_tasks() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![
+                task_with_times(100_000, now),    // not due
+                task_with_times(10, now - 5_000), // due
+                task_with_times(50, now - 5_000), // due
+            ]),
+        };
+
+        let result = run_due(&mut state).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("ran").and_then(Value::as_u64), Some(2));
+        assert_eq!(state.stack.len(), 1);
+    }
 }
