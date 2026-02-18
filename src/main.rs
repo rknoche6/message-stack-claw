@@ -210,6 +210,7 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
                         "function_name": task.function_name,
                         "args": task.args,
                         "note": task.note,
+                        "dedupe_key": task.dedupe_key,
                         "delay_ms": task.delay_ms,
                         "enqueued_at_ms": task.enqueued_at_ms,
                         "remaining_delay_ms": remaining_delay_ms(task, now_ms)
@@ -1631,5 +1632,40 @@ mod tests {
 
         assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
         assert_eq!(state.stack.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stack_list_includes_dedupe_key() {
+        let mut state = AppState::default();
+        let dedupe_key = "order-123".to_string();
+        state.stack.push_back(StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"hello"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: Some("note".to_string()),
+            dedupe_key: Some(dedupe_key.clone()),
+        });
+
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name":"stack_list",
+                "arguments":{}
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        let tasks = result
+            .get("tasks")
+            .and_then(Value::as_array)
+            .expect("tasks array");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].get("dedupe_key").and_then(Value::as_str),
+            Some(dedupe_key.as_str())
+        );
     }
 }
