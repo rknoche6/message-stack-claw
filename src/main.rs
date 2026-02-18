@@ -16,6 +16,7 @@ struct StackTask {
     delay_ms: u64,
     enqueued_at_ms: u128,
     note: Option<String>,
+    dedupe_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,8 +116,8 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
         "tools/list" => json!({
           "ok": true,
           "tools": [
-            {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?"}},
-            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?}>"}},
+            {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?","dedupe_key":"string?","on_duplicate":"skip|replace|error? (default skip when dedupe_key provided)"}},
+            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?,dedupe_key?}>"}},
             {"name":"stack_list","description":"List queued deferred calls"},
             {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
             {"name":"stack_run_due","description":"Run due calls in batch without waiting","input_schema":{"limit":"number?","grace_ms":"number?"}},
@@ -147,11 +148,50 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
                 Ok(task) => task,
                 Err(err) => return json!({"ok":false,"error":err}),
             };
+
+            if let Some(dedupe_key) = task.dedupe_key.as_deref() {
+                let on_duplicate = match parse_on_duplicate(&args) {
+                    Ok(mode) => mode,
+                    Err(err) => return json!({"ok":false,"error":err}),
+                };
+
+                if let Some(existing_idx) = state
+                    .stack
+                    .iter()
+                    .position(|existing| existing.dedupe_key.as_deref() == Some(dedupe_key))
+                {
+                    let existing_task = state.stack.get(existing_idx).cloned();
+                    match on_duplicate {
+                        OnDuplicate::Skip => {
+                            return json!({
+                                "ok": true,
+                                "inserted": false,
+                                "reason": "duplicate_dedupe_key",
+                                "dedupe_key": dedupe_key,
+                                "existing_task": existing_task,
+                                "stack_depth": state.stack.len()
+                            });
+                        }
+                        OnDuplicate::Error => {
+                            return json!({
+                                "ok": false,
+                                "error": format!("task with dedupe_key '{dedupe_key}' already exists"),
+                                "dedupe_key": dedupe_key,
+                                "existing_task": existing_task,
+                                "stack_depth": state.stack.len()
+                            });
+                        }
+                        OnDuplicate::Replace => {
+                            state.stack.remove(existing_idx);
+                        }
+                    }
+                }
+            }
             if let Err(err) = ensure_stack_capacity(state.stack.len(), 1) {
                 return json!({"ok":false,"error":err,"stack_depth":state.stack.len()});
             }
             state.stack.push_back(task.clone());
-            json!({"ok":true,"task":task,"stack_depth":state.stack.len()})
+            json!({"ok":true,"inserted":true,"task":task,"stack_depth":state.stack.len()})
         }
         "stack_push_batch" => push_batch(state, &args),
         "stack_list" => {
@@ -220,6 +260,23 @@ fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
         ),
     };
 
+    let dedupe_key = match args.get("dedupe_key") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let key = v
+                .as_str()
+                .ok_or_else(|| "dedupe_key must be a string".to_string())?
+                .trim()
+                .to_string();
+
+            if key.is_empty() {
+                return Err("dedupe_key must not be empty when provided".to_string());
+            }
+
+            Some(key)
+        }
+    };
+
     Ok(StackTask {
         id: Uuid::new_v4(),
         function_name,
@@ -227,7 +284,29 @@ fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
         delay_ms,
         enqueued_at_ms: now_unix_ms(),
         note,
+        dedupe_key,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OnDuplicate {
+    Skip,
+    Replace,
+    Error,
+}
+
+fn parse_on_duplicate(args: &Value) -> Result<OnDuplicate, String> {
+    let mode = args
+        .get("on_duplicate")
+        .and_then(Value::as_str)
+        .unwrap_or("skip");
+
+    match mode {
+        "skip" => Ok(OnDuplicate::Skip),
+        "replace" => Ok(OnDuplicate::Replace),
+        "error" => Ok(OnDuplicate::Error),
+        _ => Err("on_duplicate must be one of: skip, replace, error".to_string()),
+    }
 }
 
 fn push_batch(state: &mut AppState, args: &Value) -> Value {
@@ -280,6 +359,7 @@ fn executed_payload(task: StackTask, status: &str) -> Value {
       "function_name": task.function_name,
       "args": task.args,
       "note": task.note,
+      "dedupe_key": task.dedupe_key,
       "delay_ms": task.delay_ms,
       "enqueued_at_ms": task.enqueued_at_ms,
       "status": status
@@ -576,6 +656,7 @@ mod tests {
             delay_ms,
             enqueued_at_ms,
             note: None,
+            dedupe_key: None,
         }
     }
 
@@ -732,6 +813,7 @@ mod tests {
             delay_ms: 0,
             enqueued_at_ms: now_unix_ms(),
             note: None,
+            dedupe_key: None,
         };
         let duplicate = StackTask {
             id: shared_id,
@@ -740,6 +822,7 @@ mod tests {
             delay_ms: 0,
             enqueued_at_ms: now_unix_ms(),
             note: None,
+            dedupe_key: None,
         };
         let unique = StackTask {
             id: Uuid::new_v4(),
@@ -748,6 +831,7 @@ mod tests {
             delay_ms: 0,
             enqueued_at_ms: now_unix_ms(),
             note: None,
+            dedupe_key: None,
         };
 
         let file_payload = StackFile {
@@ -792,6 +876,7 @@ mod tests {
             delay_ms: 10_000,
             enqueued_at_ms: now.saturating_sub(7_000),
             note: None,
+            dedupe_key: None,
         };
 
         let file_payload = StackFile {
@@ -869,6 +954,7 @@ mod tests {
                 delay_ms: 0,
                 enqueued_at_ms: now_unix_ms(),
                 note: None,
+                dedupe_key: None,
             }],
         };
         fs::write(
@@ -932,5 +1018,67 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .contains("stack depth limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn stack_push_with_dedupe_key_skips_duplicate_by_default() {
+        let mut state = AppState::default();
+
+        let first = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {"function_name": "message.send", "dedupe_key": "welcome-1"}
+            }),
+        )
+        .await;
+        assert_eq!(first.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(first.get("inserted").and_then(Value::as_bool), Some(true));
+
+        let second = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {"function_name": "message.send", "dedupe_key": "welcome-1"}
+            }),
+        )
+        .await;
+
+        assert_eq!(second.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(second.get("inserted").and_then(Value::as_bool), Some(false));
+        assert_eq!(state.stack.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stack_push_with_dedupe_key_replace_mode_replaces_existing_task() {
+        let mut state = AppState::default();
+
+        let _ = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {"function_name": "message.send", "args": {"text": "old"}, "dedupe_key": "job-1"}
+            }),
+        )
+        .await;
+
+        let replaced = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {"function_name": "message.send", "args": {"text": "new"}, "dedupe_key": "job-1", "on_duplicate": "replace"}
+            }),
+        )
+        .await;
+
+        assert_eq!(replaced.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            replaced.get("inserted").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(state.stack.len(), 1);
+
+        let task = state.stack.back().expect("task");
+        assert_eq!(task.args.get("text").and_then(Value::as_str), Some("new"));
     }
 }

@@ -15,7 +15,7 @@ Examples:
 
 ## Tools exposed
 
-- `stack_push(function_name, args, delay_ms, note?)`
+- `stack_push(function_name, args, delay_ms, note?, dedupe_key?, on_duplicate?)`
 - `stack_push_batch(items[])` (atomic all-or-nothing batch enqueue, max 1000 items/call)
 - `stack_list()`
 - `stack_run_next()`
@@ -71,6 +71,25 @@ Run next queued task:
 ```json
 { "id": 3, "method": "tools/call", "params": { "name": "stack_run_next", "arguments": {} } }
 ```
+
+Idempotent enqueue with `dedupe_key` (skip duplicate by default):
+
+```json
+{
+  "id": 30,
+  "method": "tools/call",
+  "params": {
+    "name": "stack_push",
+    "arguments": {
+      "function_name": "message.send",
+      "args": { "text": "send once" },
+      "dedupe_key": "welcome-message-user-42"
+    }
+  }
+}
+```
+
+You can set `on_duplicate` to `replace` or `error` when a task with the same `dedupe_key` already exists.
 
 Batch enqueue multiple tasks atomically:
 
@@ -152,6 +171,7 @@ Restore from disk while preserving remaining delay windows (ignore downtime betw
   - max `stack_push_batch` size is capped at `1,000` items
   - `stack_push`, `stack_push_batch`, and `stack_load` fail fast with clear errors when limits would be exceeded
 - `stack_push_batch` validates the full batch first and only enqueues when all items are valid (prevents partial queue updates).
+- `stack_push` supports `dedupe_key` for idempotent scheduling; duplicate handling is configurable with `on_duplicate` (`skip`, `replace`, `error`).
 - `stack_run_due` executes due tasks without waiting and supports optional batching controls:
   - `limit`: maximum number of tasks to execute in one call
   - `grace_ms`: include near-due tasks whose remaining delay is within this window
