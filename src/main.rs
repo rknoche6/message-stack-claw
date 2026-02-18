@@ -120,7 +120,7 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_run_all","description":"Run queued calls from top to bottom"},
             {"name":"stack_clear","description":"Clear all queued calls"},
             {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
-            {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)"}}
+            {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)","pause_during_downtime":"boolean? (default false; preserves remaining delays across save→load downtime)"}}
           ]
         }),
         "tools/call" => call_tool(state, &req.params).await,
@@ -295,6 +295,16 @@ fn arg_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
     }
 }
 
+fn arg_bool(args: &Value, key: &str) -> Result<Option<bool>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a boolean")),
+    }
+}
+
 async fn run_due(state: &mut AppState, args: &Value) -> Value {
     let limit = match arg_u64(args, "limit") {
         Ok(v) => v,
@@ -380,6 +390,17 @@ fn validate_loaded_tasks(tasks: &[StackTask]) -> Result<(), String> {
     Ok(())
 }
 
+fn pause_tasks_for_downtime(tasks: &mut [StackTask], saved_at_ms: u128, now_ms: u128) {
+    let downtime_ms = now_ms.saturating_sub(saved_at_ms);
+    if downtime_ms == 0 {
+        return;
+    }
+
+    for task in tasks {
+        task.enqueued_at_ms = task.enqueued_at_ms.saturating_add(downtime_ms);
+    }
+}
+
 fn parent_dir(path: &Path) -> Option<&Path> {
     let parent = path.parent()?;
     if parent.as_os_str().is_empty() {
@@ -429,7 +450,7 @@ async fn load_stack(state: &mut AppState, args: &Value) -> Value {
         Err(err) => return json!({"ok":false,"error":format!("load failed: {err}")}),
     };
 
-    let stack_file = match stack_file_from_content(&content) {
+    let mut stack_file = match stack_file_from_content(&content) {
         Ok(file) => file,
         Err(err) => return json!({"ok":false,"error":err}),
     };
@@ -443,16 +464,25 @@ async fn load_stack(state: &mut AppState, args: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("replace");
 
+    let pause_during_downtime = match arg_bool(args, "pause_during_downtime") {
+        Ok(v) => v.unwrap_or(false),
+        Err(err) => return json!({"ok":false,"error":err}),
+    };
+
+    if pause_during_downtime {
+        pause_tasks_for_downtime(&mut stack_file.tasks, stack_file.saved_at_ms, now_unix_ms());
+    }
+
     match mode {
         "replace" => {
             state.stack = VecDeque::from(stack_file.tasks);
-            json!({"ok":true,"path":path,"loaded":state.stack.len(),"stack_depth":state.stack.len(),"mode":"replace"})
+            json!({"ok":true,"path":path,"loaded":state.stack.len(),"stack_depth":state.stack.len(),"mode":"replace","pause_during_downtime":pause_during_downtime})
         }
         "append" => {
-            let dedupe_ids = args
-                .get("dedupe_ids")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            let dedupe_ids = match arg_bool(args, "dedupe_ids") {
+                Ok(v) => v.unwrap_or(true),
+                Err(err) => return json!({"ok":false,"error":err}),
+            };
 
             let before = state.stack.len();
             let mut skipped = 0usize;
@@ -473,6 +503,7 @@ async fn load_stack(state: &mut AppState, args: &Value) -> Value {
                 "loaded": loaded,
                 "skipped": skipped,
                 "dedupe_ids": dedupe_ids,
+                "pause_during_downtime": pause_during_downtime,
                 "stack_depth": state.stack.len()
             })
         }
@@ -701,6 +732,82 @@ mod tests {
         assert_eq!(result.get("loaded").and_then(Value::as_u64), Some(1));
         assert_eq!(result.get("skipped").and_then(Value::as_u64), Some(1));
         assert_eq!(state.stack.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn load_stack_pause_during_downtime_preserves_remaining_delay() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("stack.json");
+
+        let now = now_unix_ms();
+        let saved_at_ms = now.saturating_sub(5_000);
+        let task = StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"paused"}),
+            delay_ms: 10_000,
+            enqueued_at_ms: now.saturating_sub(7_000),
+            note: None,
+        };
+
+        let file_payload = StackFile {
+            version: 1,
+            saved_at_ms,
+            tasks: vec![task],
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&file_payload).expect("serialize"),
+        )
+        .await
+        .expect("write stack file");
+
+        let mut state = AppState::default();
+        let result = load_stack(
+            &mut state,
+            &json!({"path": path.to_string_lossy().to_string(), "pause_during_downtime": true}),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(state.stack.len(), 1);
+
+        let loaded = state.stack.front().expect("loaded task");
+        let remaining = remaining_delay_ms(loaded, now_unix_ms());
+        assert!(remaining <= 8_200, "remaining too high: {remaining}");
+        assert!(remaining >= 7_700, "remaining too low: {remaining}");
+    }
+
+    #[tokio::test]
+    async fn load_stack_rejects_invalid_boolean_options() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("stack.json");
+
+        let file_payload = StackFile {
+            version: 1,
+            saved_at_ms: now_unix_ms(),
+            tasks: vec![],
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&file_payload).expect("serialize"),
+        )
+        .await
+        .expect("write stack file");
+
+        let mut state = AppState::default();
+        let result = load_stack(
+            &mut state,
+            &json!({"path": path.to_string_lossy().to_string(), "mode": "append", "dedupe_ids": "yes"}),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("dedupe_ids must be a boolean"));
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ Examples:
 - `stack_run_all()`
 - `stack_clear()`
 - `stack_save(path?)`
-- `stack_load(path?, mode?, dedupe_ids?)`
+- `stack_load(path?, mode?, dedupe_ids?, pause_during_downtime?)`
 
 ## Protocol
 
@@ -116,6 +116,23 @@ Append from a saved stack file while skipping duplicate task IDs:
 }
 ```
 
+Restore from disk while preserving remaining delay windows (ignore downtime between save and load):
+
+```json
+{
+  "id": 6,
+  "method": "tools/call",
+  "params": {
+    "name": "stack_load",
+    "arguments": {
+      "path": ".message-stack-claw.stack.json",
+      "mode": "replace",
+      "pause_during_downtime": true
+    }
+  }
+}
+```
+
 ## Notes
 
 - Stack is in-memory by default, but you can persist/restore via `stack_save` and `stack_load`.
@@ -127,6 +144,8 @@ Append from a saved stack file while skipping duplicate task IDs:
   - `replace` (default): replace in-memory stack with file contents
   - `append`: append file contents to current stack
 - In `append` mode, `dedupe_ids` defaults to `true` to avoid duplicate task IDs when reloading snapshots.
+- `stack_load` now validates boolean option types (`dedupe_ids`, `pause_during_downtime`) and fails fast on invalid payloads.
+- `pause_during_downtime: true` on `stack_load` preserves each task's remaining delay across process downtime (useful when restoring from disk after restarts).
 - `stack_run_next` waits only the **remaining** delay (delay counted from enqueue time).
 - `stack_push_batch` validates the full batch first and only enqueues when all items are valid (prevents partial queue updates).
 - `stack_run_due` executes due tasks without waiting and supports optional batching controls:
