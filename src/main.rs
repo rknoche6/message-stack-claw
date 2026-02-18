@@ -3,9 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::info;
+use tokio::signal;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +115,59 @@ const MAX_FUNCTION_NAME_LEN: usize = 256;
 const MAX_NOTE_LEN: usize = 4_096;
 const MAX_DEDUPE_KEY_LEN: usize = 512;
 const MAX_ARGS_JSON_BYTES: usize = 256 * 1024;
+const DEFAULT_SHUTDOWN_SAVE_PATH: &str = ".message-stack-claw.shutdown.json";
+
+/// Guard that auto-saves the stack on graceful shutdown.
+/// Explicitly dropped before exit to ensure persistence.
+#[derive(Debug)]
+struct ShutdownGuard {
+    enabled: bool,
+    path: PathBuf,
+}
+
+impl ShutdownGuard {
+    fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            enabled: true,
+            path: path.into(),
+        }
+    }
+
+    fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    async fn save(&self, state: &AppState) -> Result<(), String> {
+        if state.stack.is_empty() {
+            return Ok(());
+        }
+        let payload = StackFile {
+            version: 1,
+            saved_at_ms: now_unix_ms(),
+            tasks: state.stack.iter().cloned().collect(),
+        };
+        let bytes = serde_json::to_vec_pretty(&payload)
+            .map_err(|err| format!("serialize failed: {err}"))?;
+
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| format!("shutdown save: failed creating parent dir: {err}"))?;
+        }
+        let tmp_path = format!("{}.tmp-shutdown-{}", self.path.display(), Uuid::new_v4());
+        tokio::fs::write(&tmp_path, bytes)
+            .await
+            .map_err(|err| format!("shutdown save: failed writing temp file: {err}"))?;
+        tokio::fs::rename(&tmp_path, &self.path)
+            .await
+            .map_err(|err| {
+                let _ = tokio::fs::remove_file(&tmp_path);
+                format!("shutdown save: failed renaming temp file: {err}")
+            })?;
+        info!(path = %self.path.display(), saved = state.stack.len(), "Stack auto-saved on shutdown");
+        Ok(())
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StackFile {
@@ -139,6 +195,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let shutdown_path = std::env::var("STACK_SHUTDOWN_PATH")
+        .unwrap_or_else(|_| DEFAULT_SHUTDOWN_SAVE_PATH.to_string());
+    let mut guard = ShutdownGuard::new(&shutdown_path);
+
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = io::stdout();
@@ -148,8 +208,48 @@ async fn main() -> Result<()> {
     };
 
     info!("message-stack-claw MCP server started");
+    info!(shutdown_path = %shutdown_path, "Shutdown auto-save enabled");
+
+    // Attempt to recover from previous unclean shutdown
+    if let Ok(content) = fs::read_to_string(&shutdown_path).await {
+        match stack_file_from_content(&content) {
+            Ok(stack_file) if !stack_file.tasks.is_empty() => {
+                warn!(tasks = stack_file.tasks.len(), path = %shutdown_path, "Recovered tasks from unclean shutdown");
+                for task in stack_file.tasks {
+                    if state.stack.len() < MAX_STACK_DEPTH {
+                        state.stack.push_back(task);
+                    }
+                }
+                // Delete the recovery file after loading
+                let _ = fs::remove_file(&shutdown_path).await;
+            }
+            _ => {}
+        }
+    }
+
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown_requested.clone();
+
+    tokio::spawn(async move {
+        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+            .expect("Failed to create SIGINT handler");
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to create SIGTERM handler");
+
+        tokio::select! {
+            _ = sigint.recv() => {},
+            _ = sigterm.recv() => {},
+        }
+        info!("Shutdown signal received, initiating graceful shutdown...");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    });
 
     while let Some(line) = lines.next_line().await? {
+        if shutdown_requested.load(Ordering::SeqCst) {
+            info!("Shutdown requested, completing current request...");
+            break;
+        }
+
         if line.trim().is_empty() {
             continue;
         }
@@ -182,6 +282,15 @@ async fn main() -> Result<()> {
         .await?;
     }
 
+    // Graceful shutdown: auto-save stack before exit
+    if guard.enabled && !state.stack.is_empty() {
+        if let Err(err) = guard.save(&state).await {
+            warn!(error = %err, "Failed to auto-save stack on shutdown");
+        }
+    }
+    guard.disable();
+
+    info!("message-stack-claw MCP server shutdown complete");
     Ok(())
 }
 
@@ -1876,5 +1985,52 @@ mod tests {
             cancel_metrics.get("error_count").and_then(Value::as_u64),
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_guard_saves_stack_to_disk() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("shutdown.json");
+
+        let mut state = AppState::default();
+        state.stack.push_back(task_with_times(100, now_unix_ms()));
+        state.stack.push_back(task_with_times(200, now_unix_ms()));
+
+        let guard = ShutdownGuard::new(&path);
+        guard.save(&state).await.expect("save should succeed");
+
+        assert!(path.exists());
+
+        // Verify the saved content can be loaded
+        let content = fs::read_to_string(&path).await.expect("read saved file");
+        let stack_file = stack_file_from_content(&content).expect("parse saved file");
+        assert_eq!(stack_file.tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_guard_skips_empty_stack() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("shutdown.json");
+
+        let state = AppState::default();
+        let guard = ShutdownGuard::new(&path);
+
+        // Should succeed without creating file for empty stack
+        guard.save(&state).await.expect("save should succeed");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_guard_creates_parent_directories() {
+        let tmp = tempdir().expect("temp dir");
+        let nested_path = tmp.path().join("nested").join("shutdown.json");
+
+        let mut state = AppState::default();
+        state.stack.push_back(task_with_times(100, now_unix_ms()));
+
+        let guard = ShutdownGuard::new(&nested_path);
+        guard.save(&state).await.expect("save should succeed");
+
+        assert!(nested_path.exists());
     }
 }
