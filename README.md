@@ -16,7 +16,7 @@ Examples:
 ## Tools exposed
 
 - `stack_push(function_name, args, delay_ms, note?)`
-- `stack_push_batch(items[])` (atomic all-or-nothing batch enqueue)
+- `stack_push_batch(items[])` (atomic all-or-nothing batch enqueue, max 1000 items/call)
 - `stack_list()`
 - `stack_run_next()`
 - `stack_run_due(limit?, grace_ms?)`
@@ -147,6 +147,10 @@ Restore from disk while preserving remaining delay windows (ignore downtime betw
 - `stack_load` now validates boolean option types (`dedupe_ids`, `pause_during_downtime`) and fails fast on invalid payloads.
 - `pause_during_downtime: true` on `stack_load` preserves each task's remaining delay across process downtime (useful when restoring from disk after restarts).
 - `stack_run_next` waits only the **remaining** delay (delay counted from enqueue time).
+- To prevent runaway memory growth in long-lived OpenClaw sessions:
+  - max stack depth is capped at `10,000` tasks
+  - max `stack_push_batch` size is capped at `1,000` items
+  - `stack_push`, `stack_push_batch`, and `stack_load` fail fast with clear errors when limits would be exceeded
 - `stack_push_batch` validates the full batch first and only enqueues when all items are valid (prevents partial queue updates).
 - `stack_run_due` executes due tasks without waiting and supports optional batching controls:
   - `limit`: maximum number of tasks to execute in one call

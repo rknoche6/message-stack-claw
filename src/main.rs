@@ -38,6 +38,9 @@ struct AppState {
     stack: VecDeque<StackTask>,
 }
 
+const MAX_STACK_DEPTH: usize = 10_000;
+const MAX_BATCH_ITEMS: usize = 1_000;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StackFile {
     version: u64,
@@ -113,7 +116,7 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
           "ok": true,
           "tools": [
             {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?"}},
-            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?}>"}},
+            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?}>"}},
             {"name":"stack_list","description":"List queued deferred calls"},
             {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
             {"name":"stack_run_due","description":"Run due calls in batch without waiting","input_schema":{"limit":"number?","grace_ms":"number?"}},
@@ -144,6 +147,9 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
                 Ok(task) => task,
                 Err(err) => return json!({"ok":false,"error":err}),
             };
+            if let Err(err) = ensure_stack_capacity(state.stack.len(), 1) {
+                return json!({"ok":false,"error":err,"stack_depth":state.stack.len()});
+            }
             state.stack.push_back(task.clone());
             json!({"ok":true,"task":task,"stack_depth":state.stack.len()})
         }
@@ -233,6 +239,19 @@ fn push_batch(state: &mut AppState, args: &Value) -> Value {
         return json!({"ok":true,"pushed":0,"tasks":[],"stack_depth":state.stack.len()});
     }
 
+    if items.len() > MAX_BATCH_ITEMS {
+        return json!({
+            "ok": false,
+            "error": format!("batch too large: {} items (max {MAX_BATCH_ITEMS})", items.len()),
+            "pushed": 0,
+            "stack_depth": state.stack.len()
+        });
+    }
+
+    if let Err(err) = ensure_stack_capacity(state.stack.len(), items.len()) {
+        return json!({"ok":false,"error":err,"pushed":0,"stack_depth":state.stack.len()});
+    }
+
     let mut parsed = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
         match parse_stack_task(item) {
@@ -303,6 +322,20 @@ fn arg_bool(args: &Value, key: &str) -> Result<Option<bool>, String> {
             .map(Some)
             .ok_or_else(|| format!("{key} must be a boolean")),
     }
+}
+
+fn ensure_stack_capacity(current: usize, additional: usize) -> Result<(), String> {
+    let Some(projected) = current.checked_add(additional) else {
+        return Err("stack capacity overflow".to_string());
+    };
+
+    if projected > MAX_STACK_DEPTH {
+        return Err(format!(
+            "stack depth limit exceeded: projected {projected}, max {MAX_STACK_DEPTH}"
+        ));
+    }
+
+    Ok(())
 }
 
 async fn run_due(state: &mut AppState, args: &Value) -> Value {
@@ -475,6 +508,13 @@ async fn load_stack(state: &mut AppState, args: &Value) -> Value {
 
     match mode {
         "replace" => {
+            if stack_file.tasks.len() > MAX_STACK_DEPTH {
+                return json!({
+                    "ok": false,
+                    "error": format!("stack depth limit exceeded: file has {} tasks, max {MAX_STACK_DEPTH}", stack_file.tasks.len())
+                });
+            }
+
             state.stack = VecDeque::from(stack_file.tasks);
             json!({"ok":true,"path":path,"loaded":state.stack.len(),"stack_depth":state.stack.len(),"mode":"replace","pause_during_downtime":pause_during_downtime})
         }
@@ -485,6 +525,10 @@ async fn load_stack(state: &mut AppState, args: &Value) -> Value {
             };
 
             let before = state.stack.len();
+            if let Err(err) = ensure_stack_capacity(before, stack_file.tasks.len()) {
+                return json!({"ok":false,"error":err,"mode":"append","stack_depth":state.stack.len()});
+            }
+
             let mut skipped = 0usize;
 
             for task in stack_file.tasks {
@@ -848,5 +892,45 @@ mod tests {
             .unwrap_or_default()
             .contains("empty function_name"));
         assert!(state.stack.is_empty());
+    }
+
+    #[test]
+    fn push_batch_rejects_batches_over_limit() {
+        let mut state = AppState::default();
+        let items: Vec<Value> = (0..(MAX_BATCH_ITEMS + 1))
+            .map(|i| json!({"function_name":"message.send","args":{"index":i}}))
+            .collect();
+
+        let result = push_batch(&mut state, &json!({"items": items}));
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("batch too large"));
+    }
+
+    #[tokio::test]
+    async fn stack_push_rejects_when_stack_is_at_capacity() {
+        let mut state = AppState::default();
+        for _ in 0..MAX_STACK_DEPTH {
+            state.stack.push_back(task_with_times(0, now_unix_ms()));
+        }
+
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {"function_name": "message.send", "args": {"text": "extra"}}
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("stack depth limit exceeded"));
     }
 }
