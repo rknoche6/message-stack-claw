@@ -20,6 +20,8 @@ struct StackTask {
     enqueued_at_ms: u128,
     note: Option<String>,
     dedupe_key: Option<String>,
+    /// Optional TTL: task expires if not executed within this many ms of enqueue time
+    ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -189,6 +191,25 @@ fn remaining_delay_ms(task: &StackTask, now_ms: u128) -> u64 {
     task.delay_ms.saturating_sub(elapsed as u64)
 }
 
+/// Check if a task has expired based on its TTL
+fn is_task_expired(task: &StackTask, now_ms: u128) -> bool {
+    match task.ttl_ms {
+        None => false,
+        Some(ttl) => {
+            let elapsed = now_ms.saturating_sub(task.enqueued_at_ms);
+            elapsed > ttl as u128
+        }
+    }
+}
+
+/// Calculate remaining TTL for a task (0 if expired)
+fn remaining_ttl_ms(task: &StackTask, now_ms: u128) -> Option<u64> {
+    task.ttl_ms.map(|ttl| {
+        let elapsed = now_ms.saturating_sub(task.enqueued_at_ms);
+        ttl.saturating_sub(elapsed as u64)
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -319,16 +340,17 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
         "tools/list" => json!({
           "ok": true,
           "tools": [
-            {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?","dedupe_key":"string?","on_duplicate":"skip|replace|error? (default skip when dedupe_key provided)"}},
-            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?,dedupe_key?}>","on_duplicate":"skip|replace|error? (default skip when any dedupe_key provided)"}},
-            {"name":"stack_list","description":"List queued deferred calls"},
-            {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
-            {"name":"stack_run_due","description":"Run due calls in batch without waiting","input_schema":{"limit":"number?","grace_ms":"number?"}},
-            {"name":"stack_run_all","description":"Run queued calls from top to bottom"},
+            {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?","dedupe_key":"string?","ttl_ms":"number? (must be > delay_ms; task expires if not executed within this time)","on_duplicate":"skip|replace|error? (default skip when dedupe_key provided)"}},
+            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?,dedupe_key?,ttl_ms?}>","on_duplicate":"skip|replace|error? (default skip when any dedupe_key provided)"}},
+            {"name":"stack_list","description":"List queued deferred calls (includes expiration info)"},
+            {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate. Skips expired tasks automatically."},
+            {"name":"stack_run_due","description":"Run due calls in batch without waiting (expired tasks are dropped)","input_schema":{"limit":"number?","grace_ms":"number?"}},
+            {"name":"stack_run_all","description":"Run queued calls from top to bottom (expired tasks are dropped)"},
             {"name":"stack_cancel","description":"Cancel queued calls by id, dedupe_key, or function_name","input_schema":{"id":"uuid?","dedupe_key":"string?","function_name":"string?","limit":"number? (default all matches)"}},
             {"name":"stack_clear","description":"Clear all queued calls"},
             {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
             {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)","pause_during_downtime":"boolean? (default false; preserves remaining delays across save→load downtime)"}},
+            {"name":"stack_cleanup_expired","description":"Remove all expired tasks from the stack","input_schema":{}},
             {"name":"health_check","description":"Health check and server metrics","input_schema":{}}
           ]
         }),
@@ -414,6 +436,7 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
                 .stack
                 .iter()
                 .map(|task| {
+                    let expired = is_task_expired(task, now_ms);
                     json!({
                         "id": task.id,
                         "function_name": task.function_name,
@@ -422,20 +445,33 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
                         "dedupe_key": task.dedupe_key,
                         "delay_ms": task.delay_ms,
                         "enqueued_at_ms": task.enqueued_at_ms,
-                        "remaining_delay_ms": remaining_delay_ms(task, now_ms)
+                        "remaining_delay_ms": remaining_delay_ms(task, now_ms),
+                        "ttl_ms": task.ttl_ms,
+                        "expired": expired,
+                        "remaining_ttl_ms": remaining_ttl_ms(task, now_ms)
                     })
                 })
                 .collect();
-            json!({"ok":true,"stack_depth":state.stack.len(),"tasks":tasks,"now_ms":now_ms})
+            let expired_count = tasks
+                .iter()
+                .filter(|t| t.get("expired").and_then(Value::as_bool).unwrap_or(false))
+                .count();
+            json!({"ok":true,"stack_depth":state.stack.len(),"expired_count":expired_count,"tasks":tasks,"now_ms":now_ms})
         }
         "stack_run_next" => run_next(state).await,
         "stack_run_due" => run_due(state, &args).await,
         "stack_run_all" => {
+            let now_ms = now_unix_ms();
+            // Pre-clean expired tasks
+            let expired_before = state.stack.len();
+            state.stack.retain(|task| !is_task_expired(task, now_ms));
+            let expired_dropped = expired_before.saturating_sub(state.stack.len());
+
             let mut results = vec![];
             while !state.stack.is_empty() {
                 results.push(run_next(state).await);
             }
-            json!({"ok":true,"results":results})
+            json!({"ok":true,"expired_dropped":expired_dropped,"results":results})
         }
         "stack_cancel" => cancel_tasks(state, &args),
         "stack_clear" => {
@@ -445,6 +481,7 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
         }
         "stack_save" => save_stack(state, &args).await,
         "stack_load" => load_stack(state, &args).await,
+        "stack_cleanup_expired" => cleanup_expired(state),
         "health_check" => json!({
             "ok": true,
             "status": "healthy",
@@ -550,6 +587,28 @@ fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
         }
     };
 
+    let ttl_ms = match args.get("ttl_ms") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let ttl = v
+                .as_u64()
+                .ok_or_else(|| "ttl_ms must be a non-negative integer".to_string())?;
+            if ttl == 0 {
+                return Err("ttl_ms must be greater than 0 when provided".to_string());
+            }
+            Some(ttl)
+        }
+    };
+
+    // Validate that ttl_ms is greater than delay_ms if both are specified
+    if let Some(ttl) = ttl_ms {
+        if ttl <= delay_ms {
+            return Err(format!(
+                "ttl_ms ({ttl}) must be greater than delay_ms ({delay_ms})"
+            ));
+        }
+    }
+
     let args_value = args.get("args").cloned().unwrap_or_else(|| json!({}));
 
     validate_task_fields(
@@ -567,6 +626,7 @@ fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
         enqueued_at_ms: now_unix_ms(),
         note,
         dedupe_key,
+        ttl_ms,
     })
 }
 
@@ -769,21 +829,27 @@ fn executed_payload(task: StackTask, status: &str) -> Value {
 }
 
 async fn run_next(state: &mut AppState) -> Value {
-    let Some(task) = state.stack.pop_back() else {
-        return json!({"ok":false,"error":"stack is empty"});
-    };
+    // Skip expired tasks
+    let now_ms = now_unix_ms();
+    while let Some(task) = state.stack.pop_back() {
+        if is_task_expired(&task, now_ms) {
+            continue; // Drop expired task silently
+        }
 
-    let remaining_ms = remaining_delay_ms(&task, now_unix_ms());
-    if remaining_ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
+        let remaining_ms = remaining_delay_ms(&task, now_ms);
+        if remaining_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
+        }
+
+        return json!({
+          "ok": true,
+          "waited_ms": remaining_ms,
+          "executed": executed_payload(task, "executed"),
+          "stack_depth": state.stack.len()
+        });
     }
 
-    json!({
-      "ok": true,
-      "waited_ms": remaining_ms,
-      "executed": executed_payload(task, "executed"),
-      "stack_depth": state.stack.len()
-    })
+    json!({"ok":false,"error":"stack is empty"})
 }
 
 fn arg_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
@@ -839,6 +905,18 @@ async fn run_due(state: &mut AppState, args: &Value) -> Value {
     }
 
     let now_ms = now_unix_ms();
+
+    // First pass: remove expired tasks and collect due indices
+    let mut expired_count = 0usize;
+    state.stack.retain(|task| {
+        if is_task_expired(task, now_ms) {
+            expired_count += 1;
+            false // Remove expired task
+        } else {
+            true // Keep non-expired task
+        }
+    });
+
     let mut due_indices = Vec::new();
     for idx in (0..state.stack.len()).rev() {
         if let Some(task) = state.stack.get(idx) {
@@ -866,6 +944,7 @@ async fn run_due(state: &mut AppState, args: &Value) -> Value {
     json!({
         "ok": true,
         "ran": results.len(),
+        "expired_dropped": expired_count,
         "results": results,
         "stack_depth": state.stack.len(),
         "now_ms": now_ms,
@@ -980,6 +1059,37 @@ fn cancel_tasks(state: &mut AppState, args: &Value) -> Value {
         },
         "limit": limit,
         "stack_depth": state.stack.len()
+    })
+}
+
+fn cleanup_expired(state: &mut AppState) -> Value {
+    let now_ms = now_unix_ms();
+    let before_count = state.stack.len();
+
+    let removed: Vec<Value> = state
+        .stack
+        .iter()
+        .filter(|task| is_task_expired(task, now_ms))
+        .map(|task| {
+            json!({
+                "id": task.id,
+                "function_name": task.function_name,
+                "ttl_ms": task.ttl_ms,
+                "enqueued_at_ms": task.enqueued_at_ms
+            })
+        })
+        .collect();
+
+    state.stack.retain(|task| !is_task_expired(task, now_ms));
+
+    let removed_count = before_count.saturating_sub(state.stack.len());
+
+    json!({
+        "ok": true,
+        "removed": removed_count,
+        "tasks": removed,
+        "stack_depth": state.stack.len(),
+        "now_ms": now_ms
     })
 }
 
@@ -1172,6 +1282,7 @@ mod tests {
             enqueued_at_ms,
             note: None,
             dedupe_key: None,
+            ttl_ms: None,
         }
     }
 
@@ -1297,6 +1408,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: None,
             dedupe_key: Some("dup-1".to_string()),
+            ttl_ms: None,
         });
 
         let result = push_batch(
@@ -1326,6 +1438,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: None,
             dedupe_key: Some("job-1".to_string()),
+            ttl_ms: None,
         });
 
         let result = push_batch(
@@ -1374,6 +1487,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: None,
             dedupe_key: Some("job-1".to_string()),
+            ttl_ms: None,
         });
 
         let result = push_batch(
@@ -1440,6 +1554,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: None,
             dedupe_key: None,
+            ttl_ms: None,
         };
         let duplicate = StackTask {
             id: shared_id,
@@ -1449,6 +1564,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: None,
             dedupe_key: None,
+            ttl_ms: None,
         };
         let unique = StackTask {
             id: Uuid::new_v4(),
@@ -1458,6 +1574,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: None,
             dedupe_key: None,
+            ttl_ms: None,
         };
 
         let file_payload = StackFile {
@@ -1504,6 +1621,7 @@ mod tests {
             enqueued_at_ms: now.saturating_sub(7_000),
             note: None,
             dedupe_key: None,
+            ttl_ms: None,
         };
 
         let file_payload = StackFile {
@@ -1582,6 +1700,7 @@ mod tests {
                 enqueued_at_ms: now_unix_ms(),
                 note: None,
                 dedupe_key: None,
+                ttl_ms: None,
             }],
         };
         fs::write(
@@ -1649,6 +1768,7 @@ mod tests {
                 enqueued_at_ms: now_unix_ms(),
                 note: None,
                 dedupe_key: None,
+                ttl_ms: None,
             }],
         };
         fs::write(
@@ -1786,6 +1906,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: None,
             dedupe_key: Some("k-1".to_string()),
+            ttl_ms: None,
         };
         let t2 = StackTask {
             id: Uuid::new_v4(),
@@ -1795,6 +1916,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: None,
             dedupe_key: Some("k-2".to_string()),
+            ttl_ms: None,
         };
         state.stack.push_back(t1);
         state.stack.push_back(t2);
@@ -1865,6 +1987,7 @@ mod tests {
             enqueued_at_ms: now_unix_ms(),
             note: Some("note".to_string()),
             dedupe_key: Some(dedupe_key.clone()),
+            ttl_ms: None,
         });
 
         let result = call_tool(
@@ -2075,5 +2198,295 @@ mod tests {
         });
         let normal_line = serde_json::to_string(&normal_request).expect("serialize");
         assert!(normal_line.len() < MAX_REQUEST_SIZE_BYTES);
+    }
+
+    // TTL-related tests
+    #[test]
+    fn is_task_expired_returns_true_when_ttl_elapsed() {
+        let now = 10_000u128;
+        let task = StackTask {
+            id: Uuid::new_v4(),
+            function_name: "test".to_string(),
+            args: json!({}),
+            delay_ms: 0,
+            enqueued_at_ms: 5_000, // Enqueued 5 seconds ago
+            note: None,
+            dedupe_key: None,
+            ttl_ms: Some(3_000), // TTL is 3 seconds
+        };
+
+        assert!(is_task_expired(&task, now)); // 5s elapsed > 3s ttl
+    }
+
+    #[test]
+    fn is_task_expired_returns_false_when_ttl_not_elapsed() {
+        let now = 7_000u128;
+        let task = StackTask {
+            id: Uuid::new_v4(),
+            function_name: "test".to_string(),
+            args: json!({}),
+            delay_ms: 0,
+            enqueued_at_ms: 5_000, // Enqueued 2 seconds ago
+            note: None,
+            dedupe_key: None,
+            ttl_ms: Some(3_000), // TTL is 3 seconds
+        };
+
+        assert!(!is_task_expired(&task, now)); // 2s elapsed < 3s ttl
+    }
+
+    #[test]
+    fn is_task_expired_returns_false_when_no_ttl() {
+        let task = StackTask {
+            id: Uuid::new_v4(),
+            function_name: "test".to_string(),
+            args: json!({}),
+            delay_ms: 0,
+            enqueued_at_ms: 0,
+            note: None,
+            dedupe_key: None,
+            ttl_ms: None,
+        };
+
+        assert!(!is_task_expired(&task, u128::MAX)); // Never expires
+    }
+
+    #[tokio::test]
+    async fn stack_push_accepts_valid_ttl() {
+        let mut state = AppState::default();
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {
+                    "function_name": "test.call",
+                    "delay_ms": 1000,
+                    "ttl_ms": 5000
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(state.stack.len(), 1);
+
+        let task = state.stack.front().expect("task");
+        assert_eq!(task.ttl_ms, Some(5000));
+    }
+
+    #[tokio::test]
+    async fn stack_push_rejects_ttl_less_than_delay() {
+        let mut state = AppState::default();
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {
+                    "function_name": "test.call",
+                    "delay_ms": 5000,
+                    "ttl_ms": 3000
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("ttl_ms (3000) must be greater than delay_ms (5000)"));
+        assert!(state.stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stack_push_rejects_zero_ttl() {
+        let mut state = AppState::default();
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {
+                    "function_name": "test.call",
+                    "ttl_ms": 0
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("ttl_ms must be greater than 0 when provided"));
+    }
+
+    #[tokio::test]
+    async fn run_next_skips_expired_tasks() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "expired".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now.saturating_sub(10_000),
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: Some(5_000), // Expired: 10s elapsed > 5s ttl
+                },
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "valid".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: Some(10_000), // Valid: 0s elapsed < 10s ttl
+                },
+            ]),
+            ..Default::default()
+        };
+
+        // run_next pops from the back, so "valid" is popped first (not expired, so it runs)
+        let result = run_next(&mut state).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        // Only "valid" was executed, "expired" remains in stack
+        assert_eq!(state.stack.len(), 1);
+
+        let executed = result
+            .get("executed")
+            .and_then(Value::as_object)
+            .expect("executed object");
+        assert_eq!(
+            executed.get("function_name").and_then(Value::as_str),
+            Some("valid")
+        );
+
+        // Second run_next skips the expired task and returns "stack is empty"
+        let result2 = run_next(&mut state).await;
+        assert_eq!(result2.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result2
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("stack is empty"));
+        // Expired task was skipped and dropped
+        assert_eq!(state.stack.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_due_drops_expired_tasks() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "expired".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now.saturating_sub(10_000),
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: Some(5_000), // Expired
+                },
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "valid".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None, // No TTL
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let result = run_due(&mut state, &json!({})).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result.get("expired_dropped").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(result.get("ran").and_then(Value::as_u64), Some(1));
+        assert!(state.stack.is_empty());
+    }
+
+    #[test]
+    fn cleanup_expired_removes_expired_tasks() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "expired".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now.saturating_sub(10_000),
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: Some(5_000), // Expired
+                },
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "valid".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: Some(60_000), // Not expired
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let result = cleanup_expired(&mut state);
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("removed").and_then(Value::as_u64), Some(1));
+        assert_eq!(state.stack.len(), 1);
+
+        let remaining = state.stack.front().expect("remaining task");
+        assert_eq!(remaining.function_name, "valid");
+    }
+
+    #[tokio::test]
+    async fn stack_list_shows_expiration_info() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![StackTask {
+                id: Uuid::new_v4(),
+                function_name: "test".to_string(),
+                args: json!({}),
+                delay_ms: 1000,
+                enqueued_at_ms: now,
+                note: None,
+                dedupe_key: None,
+                ttl_ms: Some(5000),
+            }]),
+            ..Default::default()
+        };
+
+        let result = call_tool(&mut state, &json!({"name": "stack_list"})).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+
+        let tasks = result
+            .get("tasks")
+            .and_then(Value::as_array)
+            .expect("tasks array");
+        assert_eq!(tasks.len(), 1);
+
+        let task = &tasks[0];
+        assert_eq!(task.get("ttl_ms").and_then(Value::as_u64), Some(5000));
+        assert_eq!(
+            task.get("remaining_ttl_ms").and_then(Value::as_u64),
+            Some(5000)
+        );
+        assert_eq!(task.get("expired").and_then(Value::as_bool), Some(false));
     }
 }
