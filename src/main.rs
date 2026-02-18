@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -117,7 +117,7 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
           "ok": true,
           "tools": [
             {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?","dedupe_key":"string?","on_duplicate":"skip|replace|error? (default skip when dedupe_key provided)"}},
-            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?,dedupe_key?}>"}},
+            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?,dedupe_key?}>","on_duplicate":"skip|replace|error? (default skip when any dedupe_key provided)"}},
             {"name":"stack_list","description":"List queued deferred calls"},
             {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
             {"name":"stack_run_due","description":"Run due calls in batch without waiting","input_schema":{"limit":"number?","grace_ms":"number?"}},
@@ -327,9 +327,12 @@ fn push_batch(state: &mut AppState, args: &Value) -> Value {
         });
     }
 
-    if let Err(err) = ensure_stack_capacity(state.stack.len(), items.len()) {
-        return json!({"ok":false,"error":err,"pushed":0,"stack_depth":state.stack.len()});
-    }
+    let on_duplicate = match parse_on_duplicate(args) {
+        Ok(mode) => mode,
+        Err(err) => {
+            return json!({"ok":false,"error":err,"pushed":0,"stack_depth":state.stack.len()})
+        }
+    };
 
     let mut parsed = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
@@ -346,11 +349,128 @@ fn push_batch(state: &mut AppState, args: &Value) -> Value {
         }
     }
 
-    for task in &parsed {
+    let existing_dedupe_keys: HashSet<String> = state
+        .stack
+        .iter()
+        .filter_map(|task| task.dedupe_key.clone())
+        .collect();
+
+    let mut tasks_to_insert = Vec::with_capacity(parsed.len());
+    let mut insert_positions: HashMap<String, usize> = HashMap::new();
+    let mut keys_to_replace_existing: HashSet<String> = HashSet::new();
+
+    let mut skipped = 0usize;
+    let mut replaced_existing = 0usize;
+    let mut replaced_in_batch = 0usize;
+
+    for task in parsed {
+        let Some(dedupe_key) = task.dedupe_key.clone() else {
+            tasks_to_insert.push(task);
+            continue;
+        };
+
+        if let Some(existing_insert_pos) = insert_positions.get(&dedupe_key).copied() {
+            match on_duplicate {
+                OnDuplicate::Skip => {
+                    skipped += 1;
+                }
+                OnDuplicate::Error => {
+                    return json!({
+                        "ok": false,
+                        "error": format!("batch contains duplicate dedupe_key '{dedupe_key}'"),
+                        "dedupe_key": dedupe_key,
+                        "pushed": 0,
+                        "stack_depth": state.stack.len()
+                    });
+                }
+                OnDuplicate::Replace => {
+                    tasks_to_insert[existing_insert_pos] = task;
+                    replaced_in_batch += 1;
+                }
+            }
+            continue;
+        }
+
+        if existing_dedupe_keys.contains(&dedupe_key) {
+            match on_duplicate {
+                OnDuplicate::Skip => {
+                    skipped += 1;
+                }
+                OnDuplicate::Error => {
+                    return json!({
+                        "ok": false,
+                        "error": format!("task with dedupe_key '{dedupe_key}' already exists"),
+                        "dedupe_key": dedupe_key,
+                        "pushed": 0,
+                        "stack_depth": state.stack.len()
+                    });
+                }
+                OnDuplicate::Replace => {
+                    tasks_to_insert.push(task);
+                    insert_positions.insert(dedupe_key.clone(), tasks_to_insert.len() - 1);
+                    if keys_to_replace_existing.insert(dedupe_key) {
+                        replaced_existing += 1;
+                    }
+                }
+            }
+            continue;
+        }
+
+        tasks_to_insert.push(task);
+        insert_positions.insert(dedupe_key, tasks_to_insert.len() - 1);
+    }
+
+    let replaced_existing_tasks = if keys_to_replace_existing.is_empty() {
+        0
+    } else {
+        state
+            .stack
+            .iter()
+            .filter(|task| {
+                task.dedupe_key
+                    .as_ref()
+                    .map(|key| keys_to_replace_existing.contains(key))
+                    .unwrap_or(false)
+            })
+            .count()
+    };
+
+    let projected_depth = state
+        .stack
+        .len()
+        .saturating_sub(replaced_existing_tasks)
+        .saturating_add(tasks_to_insert.len());
+    if projected_depth > MAX_STACK_DEPTH {
+        return json!({
+            "ok": false,
+            "error": format!("stack depth limit exceeded: projected {projected_depth}, max {MAX_STACK_DEPTH}"),
+            "pushed": 0,
+            "stack_depth": state.stack.len()
+        });
+    }
+
+    if !keys_to_replace_existing.is_empty() {
+        state.stack.retain(|task| {
+            task.dedupe_key
+                .as_ref()
+                .map(|key| !keys_to_replace_existing.contains(key))
+                .unwrap_or(true)
+        });
+    }
+
+    for task in &tasks_to_insert {
         state.stack.push_back(task.clone());
     }
 
-    json!({"ok":true,"pushed":parsed.len(),"tasks":parsed,"stack_depth":state.stack.len()})
+    json!({
+        "ok":true,
+        "pushed":tasks_to_insert.len(),
+        "tasks":tasks_to_insert,
+        "skipped":skipped,
+        "replaced_existing":replaced_existing,
+        "replaced_in_batch":replaced_in_batch,
+        "stack_depth":state.stack.len()
+    })
 }
 
 fn executed_payload(task: StackTask, status: &str) -> Value {
@@ -766,6 +886,114 @@ mod tests {
         assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(result.get("pushed").and_then(Value::as_u64), Some(2));
         assert_eq!(state.stack.len(), 2);
+    }
+
+    #[test]
+    fn push_batch_skips_existing_dedupe_keys_by_default() {
+        let mut state = AppState::default();
+        state.stack.push_back(StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"existing"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+            dedupe_key: Some("dup-1".to_string()),
+        });
+
+        let result = push_batch(
+            &mut state,
+            &json!({
+                "items": [
+                    {"function_name":"message.send","args":{"text":"new-1"},"dedupe_key":"dup-1"},
+                    {"function_name":"message.send","args":{"text":"new-2"},"dedupe_key":"dup-2"}
+                ]
+            }),
+        );
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("pushed").and_then(Value::as_u64), Some(1));
+        assert_eq!(result.get("skipped").and_then(Value::as_u64), Some(1));
+        assert_eq!(state.stack.len(), 2);
+    }
+
+    #[test]
+    fn push_batch_replace_mode_replaces_existing_and_batch_duplicates() {
+        let mut state = AppState::default();
+        state.stack.push_back(StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"old"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+            dedupe_key: Some("job-1".to_string()),
+        });
+
+        let result = push_batch(
+            &mut state,
+            &json!({
+                "on_duplicate": "replace",
+                "items": [
+                    {"function_name":"message.send","args":{"text":"new-1"},"dedupe_key":"job-1"},
+                    {"function_name":"message.send","args":{"text":"first"},"dedupe_key":"job-2"},
+                    {"function_name":"message.send","args":{"text":"second"},"dedupe_key":"job-2"}
+                ]
+            }),
+        );
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("pushed").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            result.get("replaced_existing").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            result.get("replaced_in_batch").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(state.stack.len(), 2);
+
+        let job_2 = state
+            .stack
+            .iter()
+            .find(|task| task.dedupe_key.as_deref() == Some("job-2"))
+            .expect("job-2 task");
+        assert_eq!(
+            job_2.args.get("text").and_then(Value::as_str),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn push_batch_error_mode_rejects_existing_duplicate_without_mutation() {
+        let mut state = AppState::default();
+        state.stack.push_back(StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"old"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+            dedupe_key: Some("job-1".to_string()),
+        });
+
+        let result = push_batch(
+            &mut state,
+            &json!({
+                "on_duplicate": "error",
+                "items": [
+                    {"function_name":"message.send","args":{"text":"new"},"dedupe_key":"job-1"}
+                ]
+            }),
+        );
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(state.stack.len(), 1);
+        assert_eq!(
+            state.stack[0].args.get("text").and_then(Value::as_str),
+            Some("old")
+        );
     }
 
     #[test]
