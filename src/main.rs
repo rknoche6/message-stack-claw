@@ -34,9 +34,76 @@ struct RpcResponse {
     result: Value,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ToolMetrics {
+    call_count: u64,
+    total_duration_ms: u64,
+    error_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AppMetrics {
+    requests_total: u64,
+    tools: HashMap<String, ToolMetrics>,
+    started_at_ms: u128,
+}
+
+impl AppMetrics {
+    fn new() -> Self {
+        Self {
+            started_at_ms: now_unix_ms(),
+            ..Default::default()
+        }
+    }
+
+    fn record_tool_call(&mut self, tool_name: &str, duration_ms: u64, is_error: bool) {
+        self.requests_total += 1;
+        let entry = self.tools.entry(tool_name.to_string()).or_default();
+        entry.call_count += 1;
+        entry.total_duration_ms += duration_ms;
+        if is_error {
+            entry.error_count += 1;
+        }
+    }
+
+    fn uptime_ms(&self) -> u128 {
+        now_unix_ms().saturating_sub(self.started_at_ms)
+    }
+
+    fn summary(&self) -> Value {
+        let tools: HashMap<String, Value> = self
+            .tools
+            .iter()
+            .map(|(name, m)| {
+                let avg_ms = if m.call_count > 0 {
+                    m.total_duration_ms / m.call_count
+                } else {
+                    0
+                };
+                (
+                    name.clone(),
+                    json!({
+                        "call_count": m.call_count,
+                        "error_count": m.error_count,
+                        "avg_duration_ms": avg_ms,
+                        "total_duration_ms": m.total_duration_ms,
+                    }),
+                )
+            })
+            .collect();
+
+        json!({
+            "requests_total": self.requests_total,
+            "uptime_ms": self.uptime_ms(),
+            "tools": tools,
+        })
+    }
+}
+
 #[derive(Default)]
 struct AppState {
     stack: VecDeque<StackTask>,
+    metrics: AppMetrics,
 }
 
 const MAX_STACK_DEPTH: usize = 10_000;
@@ -75,7 +142,10 @@ async fn main() -> Result<()> {
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = io::stdout();
-    let mut state = AppState::default();
+    let mut state = AppState {
+        stack: VecDeque::default(),
+        metrics: AppMetrics::new(),
+    };
 
     info!("message-stack-claw MCP server started");
 
@@ -129,7 +199,8 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_cancel","description":"Cancel queued calls by id, dedupe_key, or function_name","input_schema":{"id":"uuid?","dedupe_key":"string?","function_name":"string?","limit":"number? (default all matches)"}},
             {"name":"stack_clear","description":"Clear all queued calls"},
             {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
-            {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)","pause_during_downtime":"boolean? (default false; preserves remaining delays across save→load downtime)"}}
+            {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)","pause_during_downtime":"boolean? (default false; preserves remaining delays across save→load downtime)"}},
+            {"name":"health_check","description":"Health check and server metrics","input_schema":{}}
           ]
         }),
         "tools/call" => call_tool(state, &req.params).await,
@@ -147,6 +218,15 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    let start_ms = now_unix_ms();
+    let result = call_tool_inner(state, tool, &args).await;
+    let duration_ms = (now_unix_ms() - start_ms) as u64;
+    let is_error = result.get("ok").and_then(Value::as_bool) == Some(false);
+    state.metrics.record_tool_call(tool, duration_ms, is_error);
+    result
+}
+
+async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Value {
     match tool {
         "stack_push" => {
             let task = match parse_stack_task(&args) {
@@ -198,7 +278,7 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
             state.stack.push_back(task.clone());
             json!({"ok":true,"inserted":true,"task":task,"stack_depth":state.stack.len()})
         }
-        "stack_push_batch" => push_batch(state, &args),
+        "stack_push_batch" => push_batch(state, args),
         "stack_list" => {
             let now_ms = now_unix_ms();
             let tasks: Vec<Value> = state
@@ -236,6 +316,12 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
         }
         "stack_save" => save_stack(state, &args).await,
         "stack_load" => load_stack(state, &args).await,
+        "health_check" => json!({
+            "ok": true,
+            "status": "healthy",
+            "stack_depth": state.stack.len(),
+            "metrics": state.metrics.summary()
+        }),
         _ => json!({"ok":false,"error":format!("unknown tool: {tool}")}),
     }
 }
@@ -981,6 +1067,7 @@ mod tests {
                 task_with_times(10, now - 5_000), // due
                 task_with_times(50, now - 5_000), // due
             ]),
+            ..Default::default()
         };
 
         let result = run_due(&mut state, &json!({})).await;
@@ -998,6 +1085,7 @@ mod tests {
                 task_with_times(10, now - 5_000),
                 task_with_times(10, now - 5_000),
             ]),
+            ..Default::default()
         };
 
         let result = run_due(&mut state, &json!({"limit": 2})).await;
@@ -1011,6 +1099,7 @@ mod tests {
         let now = now_unix_ms();
         let mut state = AppState {
             stack: VecDeque::from(vec![task_with_times(2_000, now - 1_500)]),
+            ..Default::default()
         };
 
         let result = run_due(&mut state, &json!({"grace_ms": 600})).await;
@@ -1256,6 +1345,7 @@ mod tests {
 
         let mut state = AppState {
             stack: VecDeque::from(vec![existing]),
+            ..Default::default()
         };
 
         let result = load_stack(
@@ -1666,6 +1756,125 @@ mod tests {
         assert_eq!(
             tasks[0].get("dedupe_key").and_then(Value::as_str),
             Some(dedupe_key.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_ok_and_metrics() {
+        let mut state = AppState {
+            stack: VecDeque::from(vec![task_with_times(0, now_unix_ms())]),
+            ..Default::default()
+        };
+
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name":"health_check",
+                "arguments":{}
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result.get("status").and_then(Value::as_str),
+            Some("healthy")
+        );
+        assert_eq!(result.get("stack_depth").and_then(Value::as_u64), Some(1));
+        assert!(result.get("metrics").is_some());
+
+        let metrics = result.get("metrics").expect("metrics object");
+        assert!(metrics.get("uptime_ms").is_some());
+        assert!(metrics.get("requests_total").is_some());
+    }
+
+    #[tokio::test]
+    async fn metrics_track_tool_calls() {
+        let mut state = AppState::default();
+
+        // Make some tool calls
+        let _ = call_tool(
+            &mut state,
+            &json!({
+                "name":"stack_push",
+                "arguments":{"function_name": "test.call"}
+            }),
+        )
+        .await;
+
+        let _ = call_tool(
+            &mut state,
+            &json!({
+                "name":"stack_list",
+                "arguments":{}
+            }),
+        )
+        .await;
+
+        // Check health for metrics
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name":"health_check",
+                "arguments":{}
+            }),
+        )
+        .await;
+
+        let metrics = result.get("metrics").expect("metrics object");
+        // Note: health_check hasn't recorded itself yet (recording happens after return)
+        assert_eq!(
+            metrics.get("requests_total").and_then(Value::as_u64),
+            Some(2)
+        ); // push + list
+
+        let tools = metrics
+            .get("tools")
+            .and_then(Value::as_object)
+            .expect("tools object");
+        assert!(tools.contains_key("stack_push"));
+        assert!(tools.contains_key("stack_list"));
+        // health_check not yet in tools since metrics are captured before it records itself
+
+        let push_metrics = tools.get("stack_push").expect("push metrics");
+        assert_eq!(
+            push_metrics.get("call_count").and_then(Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_track_errors() {
+        let mut state = AppState::default();
+
+        // Make an invalid tool call that will error
+        let _ = call_tool(
+            &mut state,
+            &json!({
+                "name":"stack_cancel",
+                "arguments":{} // missing required selector
+            }),
+        )
+        .await;
+
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name":"health_check",
+                "arguments":{}
+            }),
+        )
+        .await;
+
+        let metrics = result.get("metrics").expect("metrics object");
+        let tools = metrics
+            .get("tools")
+            .and_then(Value::as_object)
+            .expect("tools object");
+        let cancel_metrics = tools.get("stack_cancel").expect("cancel metrics");
+        assert_eq!(
+            cancel_metrics.get("error_count").and_then(Value::as_u64),
+            Some(1)
         );
     }
 }
