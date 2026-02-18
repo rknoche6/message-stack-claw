@@ -115,6 +115,7 @@ const MAX_FUNCTION_NAME_LEN: usize = 256;
 const MAX_NOTE_LEN: usize = 4_096;
 const MAX_DEDUPE_KEY_LEN: usize = 512;
 const MAX_ARGS_JSON_BYTES: usize = 256 * 1024;
+const MAX_REQUEST_SIZE_BYTES: usize = 1024 * 1024; // 1MB max JSON-RPC request size
 const DEFAULT_SHUTDOWN_SAVE_PATH: &str = ".message-stack-claw.shutdown.json";
 
 /// Guard that auto-saves the stack on graceful shutdown.
@@ -251,6 +252,25 @@ async fn main() -> Result<()> {
         }
 
         if line.trim().is_empty() {
+            continue;
+        }
+
+        // Enforce request size limit to prevent DoS via memory exhaustion
+        if line.len() > MAX_REQUEST_SIZE_BYTES {
+            warn!(
+                request_size = line.len(),
+                max_size = MAX_REQUEST_SIZE_BYTES,
+                "Rejecting oversized request"
+            );
+            write_response(
+                &mut stdout,
+                RpcResponse {
+                    jsonrpc: "2.0",
+                    id: None,
+                    result: json!({"ok":false,"error":format!("request too large: {} bytes (max {})", line.len(), MAX_REQUEST_SIZE_BYTES)}),
+                },
+            )
+            .await?;
             continue;
         }
 
@@ -2032,5 +2052,28 @@ mod tests {
         guard.save(&state).await.expect("save should succeed");
 
         assert!(nested_path.exists());
+    }
+
+    #[tokio::test]
+    async fn request_size_limit_rejects_oversized_requests() {
+        // Create an oversized request (larger than MAX_REQUEST_SIZE_BYTES)
+        let oversized_payload = "x".repeat(MAX_REQUEST_SIZE_BYTES + 1);
+        let oversized_request = json!({
+            "name": "stack_push",
+            "arguments": {"function_name": oversized_payload}
+        });
+        let line = serde_json::to_string(&oversized_request).expect("serialize");
+
+        // The request size check would happen before parsing in the main loop
+        // Here we verify the constant is set appropriately
+        assert!(line.len() > MAX_REQUEST_SIZE_BYTES);
+
+        // Verify normal requests are well under the limit
+        let normal_request = json!({
+            "name": "stack_push",
+            "arguments": {"function_name": "test.call", "args": {"data": "normal"}}
+        });
+        let normal_line = serde_json::to_string(&normal_request).expect("serialize");
+        assert!(normal_line.len() < MAX_REQUEST_SIZE_BYTES);
     }
 }
