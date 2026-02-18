@@ -16,6 +16,7 @@ Examples:
 ## Tools exposed
 
 - `stack_push(function_name, args, delay_ms, note?)`
+- `stack_push_batch(items[])` (atomic all-or-nothing batch enqueue)
 - `stack_list()`
 - `stack_run_next()`
 - `stack_run_due(limit?, grace_ms?)`
@@ -71,6 +72,24 @@ Run next queued task:
 { "id": 3, "method": "tools/call", "params": { "name": "stack_run_next", "arguments": {} } }
 ```
 
+Batch enqueue multiple tasks atomically:
+
+```json
+{
+  "id": 31,
+  "method": "tools/call",
+  "params": {
+    "name": "stack_push_batch",
+    "arguments": {
+      "items": [
+        { "function_name": "message.send", "args": { "text": "step 1" }, "delay_ms": 0 },
+        { "function_name": "message.send", "args": { "text": "step 2" }, "delay_ms": 500 }
+      ]
+    }
+  }
+}
+```
+
 Batch-run due tasks, max 10 at a time, including tasks due within 250ms:
 
 ```json
@@ -91,6 +110,7 @@ Batch-run due tasks, max 10 at a time, including tasks due within 250ms:
 - `stack_save` writes atomically (temp file + rename) and creates parent directories when needed.
 - `stack_load` validates the persisted file format version and fails fast on incompatible versions.
 - `stack_run_next` waits only the **remaining** delay (delay counted from enqueue time).
+- `stack_push_batch` validates the full batch first and only enqueues when all items are valid (prevents partial queue updates).
 - `stack_run_due` executes due tasks without waiting and supports optional batching controls:
   - `limit`: maximum number of tasks to execute in one call
   - `grace_ms`: include near-due tasks whose remaining delay is within this window

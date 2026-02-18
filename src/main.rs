@@ -113,6 +113,7 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
           "ok": true,
           "tools": [
             {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?"}},
+            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?}>"}},
             {"name":"stack_list","description":"List queued deferred calls"},
             {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
             {"name":"stack_run_due","description":"Run due calls in batch without waiting","input_schema":{"limit":"number?","grace_ms":"number?"}},
@@ -139,28 +140,14 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
 
     match tool {
         "stack_push" => {
-            let function_name = args
-                .get("function_name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if function_name.is_empty() {
-                return json!({"ok":false,"error":"function_name is required"});
-            }
-            let task = StackTask {
-                id: Uuid::new_v4(),
-                function_name,
-                args: args.get("args").cloned().unwrap_or_else(|| json!({})),
-                delay_ms: args.get("delay_ms").and_then(Value::as_u64).unwrap_or(0),
-                enqueued_at_ms: now_unix_ms(),
-                note: args
-                    .get("note")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
+            let task = match parse_stack_task(&args) {
+                Ok(task) => task,
+                Err(err) => return json!({"ok":false,"error":err}),
             };
             state.stack.push_back(task.clone());
             json!({"ok":true,"task":task,"stack_depth":state.stack.len()})
         }
+        "stack_push_batch" => push_batch(state, &args),
         "stack_list" => {
             let now_ms = now_unix_ms();
             let tasks: Vec<Value> = state
@@ -198,6 +185,74 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
         "stack_load" => load_stack(state, &args).await,
         _ => json!({"ok":false,"error":format!("unknown tool: {tool}")}),
     }
+}
+
+fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
+    let function_name = args
+        .get("function_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if function_name.is_empty() {
+        return Err("function_name is required".to_string());
+    }
+
+    let delay_ms = match args.get("delay_ms") {
+        None => 0,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| "delay_ms must be a non-negative integer".to_string())?,
+    };
+
+    let note = match args.get("note") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| "note must be a string".to_string())?
+                .to_string(),
+        ),
+    };
+
+    Ok(StackTask {
+        id: Uuid::new_v4(),
+        function_name,
+        args: args.get("args").cloned().unwrap_or_else(|| json!({})),
+        delay_ms,
+        enqueued_at_ms: now_unix_ms(),
+        note,
+    })
+}
+
+fn push_batch(state: &mut AppState, args: &Value) -> Value {
+    let Some(items) = args.get("items").and_then(Value::as_array) else {
+        return json!({"ok":false,"error":"items is required and must be an array"});
+    };
+
+    if items.is_empty() {
+        return json!({"ok":true,"pushed":0,"tasks":[],"stack_depth":state.stack.len()});
+    }
+
+    let mut parsed = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        match parse_stack_task(item) {
+            Ok(task) => parsed.push(task),
+            Err(err) => {
+                return json!({
+                    "ok": false,
+                    "error": format!("items[{idx}] invalid: {err}"),
+                    "pushed": 0,
+                    "stack_depth": state.stack.len()
+                })
+            }
+        }
+    }
+
+    for task in &parsed {
+        state.stack.push_back(task.clone());
+    }
+
+    json!({"ok":true,"pushed":parsed.len(),"tasks":parsed,"stack_depth":state.stack.len()})
 }
 
 fn executed_payload(task: StackTask, status: &str) -> Value {
@@ -467,6 +522,43 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .contains("limit must be a non-negative integer"));
+    }
+
+    #[test]
+    fn push_batch_is_atomic_on_validation_error() {
+        let mut state = AppState::default();
+        state.stack.push_back(task_with_times(5, now_unix_ms()));
+
+        let result = push_batch(
+            &mut state,
+            &json!({
+                "items": [
+                    {"function_name":"message.send","args":{"text":"ok"},"delay_ms":10},
+                    {"function_name":"message.send","delay_ms":"bad"}
+                ]
+            }),
+        );
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(state.stack.len(), 1);
+    }
+
+    #[test]
+    fn push_batch_pushes_all_items() {
+        let mut state = AppState::default();
+        let result = push_batch(
+            &mut state,
+            &json!({
+                "items": [
+                    {"function_name":"message.send","args":{"text":"one"},"delay_ms":10},
+                    {"function_name":"message.send","args":{"text":"two"},"delay_ms":20,"note":"n"}
+                ]
+            }),
+        );
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("pushed").and_then(Value::as_u64), Some(2));
+        assert_eq!(state.stack.len(), 2);
     }
 
     #[test]
