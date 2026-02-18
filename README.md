@@ -18,7 +18,7 @@ Examples:
 - `stack_push(function_name, args, delay_ms, note?)`
 - `stack_list()`
 - `stack_run_next()`
-- `stack_run_due()`
+- `stack_run_due(limit?, grace_ms?)`
 - `stack_run_all()`
 - `stack_clear()`
 - `stack_save(path?)`
@@ -71,10 +71,25 @@ Run next queued task:
 { "id": 3, "method": "tools/call", "params": { "name": "stack_run_next", "arguments": {} } }
 ```
 
+Batch-run due tasks, max 10 at a time, including tasks due within 250ms:
+
+```json
+{
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "stack_run_due",
+    "arguments": { "limit": 10, "grace_ms": 250 }
+  }
+}
+```
+
 ## Notes
 
 - Stack is in-memory by default, but you can persist/restore via `stack_save` and `stack_load`.
 - Default persistence path is `.message-stack-claw.stack.json` (override with `path`).
 - `stack_run_next` waits only the **remaining** delay (delay counted from enqueue time).
-- `stack_run_due` executes all tasks that are due right now without waiting; useful for batch drains in heartbeat/deferred loops.
+- `stack_run_due` executes due tasks without waiting and supports optional batching controls:
+  - `limit`: maximum number of tasks to execute in one call
+  - `grace_ms`: include near-due tasks whose remaining delay is within this window
 - `stack_list` includes `remaining_delay_ms` for each task.

@@ -107,7 +107,7 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?"}},
             {"name":"stack_list","description":"List queued deferred calls"},
             {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate"},
-            {"name":"stack_run_due","description":"Run all currently due calls without waiting (batched)"},
+            {"name":"stack_run_due","description":"Run due calls in batch without waiting","input_schema":{"limit":"number?","grace_ms":"number?"}},
             {"name":"stack_run_all","description":"Run queued calls from top to bottom"},
             {"name":"stack_clear","description":"Clear all queued calls"},
             {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
@@ -173,7 +173,7 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
             json!({"ok":true,"stack_depth":state.stack.len(),"tasks":tasks,"now_ms":now_ms})
         }
         "stack_run_next" => run_next(state).await,
-        "stack_run_due" => run_due(state).await,
+        "stack_run_due" => run_due(state, &args).await,
         "stack_run_all" => {
             let mut results = vec![];
             while !state.stack.is_empty() {
@@ -222,7 +222,30 @@ async fn run_next(state: &mut AppState) -> Value {
     })
 }
 
-async fn run_due(state: &mut AppState) -> Value {
+fn arg_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a non-negative integer")),
+    }
+}
+
+async fn run_due(state: &mut AppState, args: &Value) -> Value {
+    let limit = match arg_u64(args, "limit") {
+        Ok(v) => v,
+        Err(err) => return json!({"ok":false,"error":err}),
+    };
+    let grace_ms = match arg_u64(args, "grace_ms") {
+        Ok(v) => v.unwrap_or(0),
+        Err(err) => return json!({"ok":false,"error":err}),
+    };
+
+    if limit == Some(0) {
+        return json!({"ok":true,"ran":0,"results":[],"stack_depth":state.stack.len(),"reason":"limit is 0"});
+    }
+
     if state.stack.is_empty() {
         return json!({"ok":true,"ran":0,"results":[],"stack_depth":0});
     }
@@ -231,13 +254,21 @@ async fn run_due(state: &mut AppState) -> Value {
     let mut due_indices = Vec::new();
     for idx in (0..state.stack.len()).rev() {
         if let Some(task) = state.stack.get(idx) {
-            if remaining_delay_ms(task, now_ms) == 0 {
+            let remaining = remaining_delay_ms(task, now_ms);
+            if remaining <= grace_ms {
                 due_indices.push(idx);
+            }
+        }
+
+        if let Some(max) = limit {
+            if due_indices.len() as u64 >= max {
+                break;
             }
         }
     }
 
-    let mut results = Vec::with_capacity(due_indices.len());
+    let selected = due_indices.len();
+    let mut results = Vec::with_capacity(selected);
     for idx in due_indices {
         if let Some(task) = state.stack.remove(idx) {
             results.push(executed_payload(task, "executed_due"));
@@ -249,7 +280,10 @@ async fn run_due(state: &mut AppState) -> Value {
         "ran": results.len(),
         "results": results,
         "stack_depth": state.stack.len(),
-        "now_ms": now_ms
+        "now_ms": now_ms,
+        "grace_ms": grace_ms,
+        "limit": limit,
+        "selected": selected
     })
 }
 
@@ -347,9 +381,51 @@ mod tests {
             ]),
         };
 
-        let result = run_due(&mut state).await;
+        let result = run_due(&mut state, &json!({})).await;
         assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(result.get("ran").and_then(Value::as_u64), Some(2));
         assert_eq!(state.stack.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_due_respects_limit() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![
+                task_with_times(10, now - 5_000),
+                task_with_times(10, now - 5_000),
+                task_with_times(10, now - 5_000),
+            ]),
+        };
+
+        let result = run_due(&mut state, &json!({"limit": 2})).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("ran").and_then(Value::as_u64), Some(2));
+        assert_eq!(state.stack.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_due_grace_ms_includes_near_due_tasks() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![task_with_times(2_000, now - 1_500)]),
+        };
+
+        let result = run_due(&mut state, &json!({"grace_ms": 600})).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("ran").and_then(Value::as_u64), Some(1));
+        assert!(state.stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_due_rejects_invalid_limit_type() {
+        let mut state = AppState::default();
+        let result = run_due(&mut state, &json!({"limit": "two"})).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("limit must be a non-negative integer"));
     }
 }
