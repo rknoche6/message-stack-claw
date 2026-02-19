@@ -11,6 +11,17 @@ use tokio::signal;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Task priority levels for quality-of-service scheduling.
+/// Higher values = higher priority. Tasks execute in priority order (highest first),
+/// with LIFO ordering within the same priority level.
+pub type TaskPriority = u8;
+
+pub const PRIORITY_LOW: TaskPriority = 0;
+pub const PRIORITY_NORMAL: TaskPriority = 5;
+pub const PRIORITY_HIGH: TaskPriority = 10;
+pub const PRIORITY_CRITICAL: TaskPriority = 20;
+pub const MAX_PRIORITY: TaskPriority = 255;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StackTask {
     id: Uuid,
@@ -22,6 +33,8 @@ struct StackTask {
     dedupe_key: Option<String>,
     /// Optional TTL: task expires if not executed within this many ms of enqueue time
     ttl_ms: Option<u64>,
+    /// Task priority (higher = more urgent). Default is PRIORITY_NORMAL (5).
+    priority: TaskPriority,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -340,12 +353,12 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
         "tools/list" => json!({
           "ok": true,
           "tools": [
-            {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?","dedupe_key":"string?","ttl_ms":"number? (must be > delay_ms; task expires if not executed within this time)","on_duplicate":"skip|replace|error? (default skip when dedupe_key provided)"}},
-            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?,dedupe_key?,ttl_ms?}>","on_duplicate":"skip|replace|error? (default skip when any dedupe_key provided)"}},
-            {"name":"stack_list","description":"List queued deferred calls (includes expiration info)"},
-            {"name":"stack_run_next","description":"Pop top call, wait only remaining delay (based on enqueue time), then execute/simulate. Skips expired tasks automatically."},
-            {"name":"stack_run_due","description":"Run due calls in batch without waiting (expired tasks are dropped)","input_schema":{"limit":"number?","grace_ms":"number?"}},
-            {"name":"stack_run_all","description":"Run queued calls from top to bottom (expired tasks are dropped)"},
+            {"name":"stack_push","description":"Push a deferred function call onto a LIFO stack","input_schema":{"function_name":"string","args":"object|any","delay_ms":"number","note":"string?","dedupe_key":"string?","ttl_ms":"number? (must be > delay_ms; task expires if not executed within this time)","on_duplicate":"skip|replace|error? (default skip when dedupe_key provided)","priority":"number? (0-255, default 5; higher = more urgent, executed first)"}},
+            {"name":"stack_push_batch","description":"Push multiple deferred function calls atomically (all-or-nothing, max 1000 items)","input_schema":{"items":"array<{function_name,args?,delay_ms?,note?,dedupe_key?,ttl_ms?,priority?}>","on_duplicate":"skip|replace|error? (default skip when any dedupe_key provided)"}},
+            {"name":"stack_list","description":"List queued deferred calls (includes priority and expiration info)","input_schema":{"min_priority":"number? (filter: only tasks with priority >= this)","max_priority":"number? (filter: only tasks with priority <= this)"}},
+            {"name":"stack_run_next","description":"Pop highest-priority call, wait only remaining delay, then execute. Skips expired tasks. Within same priority, uses LIFO (stack order)."},
+            {"name":"stack_run_due","description":"Run due calls in batch without waiting (expired tasks are dropped). Executes highest priority first.","input_schema":{"limit":"number?","grace_ms":"number?"}},
+            {"name":"stack_run_all","description":"Run queued calls from highest to lowest priority (expired tasks are dropped)"},
             {"name":"stack_cancel","description":"Cancel queued calls by id, dedupe_key, or function_name","input_schema":{"id":"uuid?","dedupe_key":"string?","function_name":"string?","limit":"number? (default all matches)"}},
             {"name":"stack_clear","description":"Clear all queued calls"},
             {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
@@ -432,9 +445,24 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
         "stack_push_batch" => push_batch(state, args),
         "stack_list" => {
             let now_ms = now_unix_ms();
+
+            // Parse optional priority filters
+            let min_priority = match arg_u64(args, "min_priority") {
+                Ok(v) => v.map(|p| p.clamp(0, MAX_PRIORITY as u64) as TaskPriority),
+                Err(err) => return json!({"ok":false,"error":err}),
+            };
+            let max_priority = match arg_u64(args, "max_priority") {
+                Ok(v) => v.map(|p| p.clamp(0, MAX_PRIORITY as u64) as TaskPriority),
+                Err(err) => return json!({"ok":false,"error":err}),
+            };
+
             let tasks: Vec<Value> = state
                 .stack
                 .iter()
+                .filter(|task| {
+                    min_priority.map_or(true, |min| task.priority >= min)
+                        && max_priority.map_or(true, |max| task.priority <= max)
+                })
                 .map(|task| {
                     let expired = is_task_expired(task, now_ms);
                     json!({
@@ -443,6 +471,7 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
                         "args": task.args,
                         "note": task.note,
                         "dedupe_key": task.dedupe_key,
+                        "priority": task.priority,
                         "delay_ms": task.delay_ms,
                         "enqueued_at_ms": task.enqueued_at_ms,
                         "remaining_delay_ms": remaining_delay_ms(task, now_ms),
@@ -456,7 +485,37 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
                 .iter()
                 .filter(|t| t.get("expired").and_then(Value::as_bool).unwrap_or(false))
                 .count();
-            json!({"ok":true,"stack_depth":state.stack.len(),"expired_count":expired_count,"tasks":tasks,"now_ms":now_ms})
+
+            let priority_stats = {
+                let mut stats: HashMap<String, u64> = HashMap::new();
+                for task in &state.stack {
+                    let bucket = if task.priority >= PRIORITY_CRITICAL {
+                        "critical"
+                    } else if task.priority >= PRIORITY_HIGH {
+                        "high"
+                    } else if task.priority >= PRIORITY_NORMAL {
+                        "normal"
+                    } else {
+                        "low"
+                    };
+                    *stats.entry(bucket.to_string()).or_insert(0) += 1;
+                }
+                stats
+            };
+
+            json!({
+                "ok": true,
+                "stack_depth": state.stack.len(),
+                "filtered_count": tasks.len(),
+                "expired_count": expired_count,
+                "priority_filters": {
+                    "min_priority": min_priority,
+                    "max_priority": max_priority
+                },
+                "priority_distribution": priority_stats,
+                "tasks": tasks,
+                "now_ms": now_ms
+            })
         }
         "stack_run_next" => run_next(state).await,
         "stack_run_due" => run_due(state, &args).await,
@@ -467,11 +526,32 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
             state.stack.retain(|task| !is_task_expired(task, now_ms));
             let expired_dropped = expired_before.saturating_sub(state.stack.len());
 
+            // Sort remaining tasks by priority (highest first), then by position (LIFO within priority)
+            let mut tasks: Vec<StackTask> = state.stack.drain(..).collect();
+            tasks.sort_by(|a, b| {
+                // Higher priority first
+                let priority_cmp = b.priority.cmp(&a.priority);
+                if priority_cmp != std::cmp::Ordering::Equal {
+                    return priority_cmp;
+                }
+                // Within same priority, newer task first (enqueued_at_ms is higher for newer)
+                b.enqueued_at_ms.cmp(&a.enqueued_at_ms)
+            });
+
             let mut results = vec![];
-            while !state.stack.is_empty() {
-                results.push(run_next(state).await);
+            for task in tasks {
+                let remaining_ms = remaining_delay_ms(&task, now_ms);
+                if remaining_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
+                }
+                results.push(json!({
+                    "ok": true,
+                    "waited_ms": remaining_ms,
+                    "executed": executed_payload(task, "executed"),
+                }));
             }
-            json!({"ok":true,"expired_dropped":expired_dropped,"results":results})
+
+            json!({"ok":true,"expired_dropped":expired_dropped,"executed":results.len(),"results":results})
         }
         "stack_cancel" => cancel_tasks(state, &args),
         "stack_clear" => {
@@ -609,6 +689,19 @@ fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
         }
     }
 
+    let priority = match args.get("priority") {
+        None | Some(Value::Null) => PRIORITY_NORMAL,
+        Some(v) => {
+            let prio = v
+                .as_u64()
+                .ok_or_else(|| "priority must be a non-negative integer (0-255)".to_string())?;
+            if prio > MAX_PRIORITY as u64 {
+                return Err(format!("priority must be <= {MAX_PRIORITY}"));
+            }
+            prio as TaskPriority
+        }
+    };
+
     let args_value = args.get("args").cloned().unwrap_or_else(|| json!({}));
 
     validate_task_fields(
@@ -627,6 +720,7 @@ fn parse_stack_task(args: &Value) -> Result<StackTask, String> {
         note,
         dedupe_key,
         ttl_ms,
+        priority,
     })
 }
 
@@ -822,6 +916,7 @@ fn executed_payload(task: StackTask, status: &str) -> Value {
       "args": task.args,
       "note": task.note,
       "dedupe_key": task.dedupe_key,
+      "priority": task.priority,
       "delay_ms": task.delay_ms,
       "enqueued_at_ms": task.enqueued_at_ms,
       "status": status
@@ -829,12 +924,31 @@ fn executed_payload(task: StackTask, status: &str) -> Value {
 }
 
 async fn run_next(state: &mut AppState) -> Value {
-    // Skip expired tasks
     let now_ms = now_unix_ms();
-    while let Some(task) = state.stack.pop_back() {
-        if is_task_expired(&task, now_ms) {
-            continue; // Drop expired task silently
+
+    // Find the index of the highest priority non-expired task
+    // Within same priority, prefer LIFO (higher index in VecDeque = newer = execute first)
+    let mut best_idx: Option<usize> = None;
+    let mut best_priority: TaskPriority = 0;
+
+    for (idx, task) in state.stack.iter().enumerate() {
+        if is_task_expired(task, now_ms) {
+            continue;
         }
+
+        // Higher priority wins; within same priority, later (higher idx) wins (LIFO)
+        if best_idx.is_none() || task.priority > best_priority {
+            best_idx = Some(idx);
+            best_priority = task.priority;
+        }
+        // Within same priority, prefer higher index (newer task)
+        else if task.priority == best_priority {
+            best_idx = Some(idx);
+        }
+    }
+
+    if let Some(idx) = best_idx {
+        let task = state.stack.remove(idx).expect("valid index");
 
         let remaining_ms = remaining_delay_ms(&task, now_ms);
         if remaining_ms > 0 {
@@ -847,6 +961,12 @@ async fn run_next(state: &mut AppState) -> Value {
           "executed": executed_payload(task, "executed"),
           "stack_depth": state.stack.len()
         });
+    }
+
+    // Check if stack has only expired tasks
+    if !state.stack.is_empty() {
+        // Clean up all expired tasks
+        state.stack.retain(|task| !is_task_expired(task, now_ms));
     }
 
     json!({"ok":false,"error":"stack is empty"})
@@ -906,40 +1026,74 @@ async fn run_due(state: &mut AppState, args: &Value) -> Value {
 
     let now_ms = now_unix_ms();
 
-    // First pass: remove expired tasks and collect due indices
+    // First pass: identify expired and due tasks
     let mut expired_count = 0usize;
-    state.stack.retain(|task| {
+    let mut due_tasks: Vec<(usize, TaskPriority)> = Vec::new();
+
+    for (idx, task) in state.stack.iter().enumerate() {
         if is_task_expired(task, now_ms) {
             expired_count += 1;
-            false // Remove expired task
-        } else {
-            true // Keep non-expired task
+            continue;
         }
+
+        let remaining = remaining_delay_ms(task, now_ms);
+        if remaining <= grace_ms {
+            due_tasks.push((idx, task.priority));
+        }
+    }
+
+    // Sort by priority (highest first), then by index (higher = newer = first, for LIFO within priority)
+    due_tasks.sort_by(|a, b| {
+        let priority_cmp = b.1.cmp(&a.1);
+        if priority_cmp != std::cmp::Ordering::Equal {
+            return priority_cmp;
+        }
+        b.0.cmp(&a.0)
     });
 
-    let mut due_indices = Vec::new();
-    for idx in (0..state.stack.len()).rev() {
-        if let Some(task) = state.stack.get(idx) {
-            let remaining = remaining_delay_ms(task, now_ms);
-            if remaining <= grace_ms {
-                due_indices.push(idx);
-            }
-        }
-
-        if let Some(max) = limit {
-            if due_indices.len() as u64 >= max {
-                break;
-            }
+    // Apply limit if specified
+    if let Some(max) = limit {
+        let max_usize = max as usize;
+        if due_tasks.len() > max_usize {
+            due_tasks.truncate(max_usize);
         }
     }
 
-    let selected = due_indices.len();
-    let mut results = Vec::with_capacity(selected);
-    for idx in due_indices {
-        if let Some(task) = state.stack.remove(idx) {
-            results.push(executed_payload(task, "executed_due"));
+    // Build a set of indices to remove (both expired and due)
+    let indices_to_remove: std::collections::HashSet<usize> =
+        due_tasks.iter().map(|(idx, _)| *idx).collect();
+
+    // Build results in priority order while filtering the stack
+    let mut results = Vec::with_capacity(due_tasks.len());
+
+    // Create a lookup for tasks to execute in priority order
+    let mut due_task_map: std::collections::HashMap<usize, &StackTask> =
+        std::collections::HashMap::new();
+    for (idx, task) in state.stack.iter().enumerate() {
+        if indices_to_remove.contains(&idx) {
+            due_task_map.insert(idx, task);
         }
     }
+
+    // Build results in priority order
+    for (idx, _) in &due_tasks {
+        if let Some(&task_ref) = due_task_map.get(idx) {
+            results.push(executed_payload(task_ref.clone(), "executed_due"));
+        }
+    }
+
+    // Build new stack by draining old one, keeping only non-due, non-expired tasks
+    let mut new_stack: VecDeque<StackTask> = VecDeque::with_capacity(state.stack.len());
+    for (idx, task) in state.stack.drain(..).enumerate() {
+        if is_task_expired(&task, now_ms) {
+            continue; // Drop expired
+        }
+        if !indices_to_remove.contains(&idx) {
+            new_stack.push_back(task); // Keep non-due tasks
+        }
+    }
+
+    state.stack = new_stack;
 
     json!({
         "ok": true,
@@ -950,7 +1104,7 @@ async fn run_due(state: &mut AppState, args: &Value) -> Value {
         "now_ms": now_ms,
         "grace_ms": grace_ms,
         "limit": limit,
-        "selected": selected
+        "selected": indices_to_remove.len()
     })
 }
 
@@ -1124,6 +1278,14 @@ fn validate_loaded_tasks(tasks: &[StackTask]) -> Result<(), String> {
             &task.args,
         )
         .map_err(|err| format!("tasks[{idx}] invalid: {err}"))?;
+
+        // Validate priority is within valid range
+        if task.priority > MAX_PRIORITY {
+            return Err(format!(
+                "tasks[{idx}] invalid: priority {} exceeds max {}",
+                task.priority, MAX_PRIORITY
+            ));
+        }
     }
     Ok(())
 }
@@ -1283,6 +1445,21 @@ mod tests {
             note: None,
             dedupe_key: None,
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
+        }
+    }
+
+    fn task_with_priority(priority: TaskPriority) -> StackTask {
+        StackTask {
+            id: Uuid::new_v4(),
+            function_name: "message.send".to_string(),
+            args: json!({"text":"hi"}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+            dedupe_key: None,
+            ttl_ms: None,
+            priority,
         }
     }
 
@@ -1409,6 +1586,7 @@ mod tests {
             note: None,
             dedupe_key: Some("dup-1".to_string()),
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         });
 
         let result = push_batch(
@@ -1439,6 +1617,7 @@ mod tests {
             note: None,
             dedupe_key: Some("job-1".to_string()),
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         });
 
         let result = push_batch(
@@ -1488,6 +1667,7 @@ mod tests {
             note: None,
             dedupe_key: Some("job-1".to_string()),
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         });
 
         let result = push_batch(
@@ -1555,6 +1735,7 @@ mod tests {
             note: None,
             dedupe_key: None,
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         };
         let duplicate = StackTask {
             id: shared_id,
@@ -1565,6 +1746,7 @@ mod tests {
             note: None,
             dedupe_key: None,
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         };
         let unique = StackTask {
             id: Uuid::new_v4(),
@@ -1575,6 +1757,7 @@ mod tests {
             note: None,
             dedupe_key: None,
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         };
 
         let file_payload = StackFile {
@@ -1622,6 +1805,7 @@ mod tests {
             note: None,
             dedupe_key: None,
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         };
 
         let file_payload = StackFile {
@@ -1701,6 +1885,7 @@ mod tests {
                 note: None,
                 dedupe_key: None,
                 ttl_ms: None,
+                priority: PRIORITY_NORMAL,
             }],
         };
         fs::write(
@@ -1769,6 +1954,7 @@ mod tests {
                 note: None,
                 dedupe_key: None,
                 ttl_ms: None,
+                priority: PRIORITY_NORMAL,
             }],
         };
         fs::write(
@@ -1907,6 +2093,7 @@ mod tests {
             note: None,
             dedupe_key: Some("k-1".to_string()),
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         };
         let t2 = StackTask {
             id: Uuid::new_v4(),
@@ -1917,6 +2104,7 @@ mod tests {
             note: None,
             dedupe_key: Some("k-2".to_string()),
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         };
         state.stack.push_back(t1);
         state.stack.push_back(t2);
@@ -1988,6 +2176,7 @@ mod tests {
             note: Some("note".to_string()),
             dedupe_key: Some(dedupe_key.clone()),
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         });
 
         let result = call_tool(
@@ -2213,6 +2402,7 @@ mod tests {
             note: None,
             dedupe_key: None,
             ttl_ms: Some(3_000), // TTL is 3 seconds
+            priority: PRIORITY_NORMAL,
         };
 
         assert!(is_task_expired(&task, now)); // 5s elapsed > 3s ttl
@@ -2230,6 +2420,7 @@ mod tests {
             note: None,
             dedupe_key: None,
             ttl_ms: Some(3_000), // TTL is 3 seconds
+            priority: PRIORITY_NORMAL,
         };
 
         assert!(!is_task_expired(&task, now)); // 2s elapsed < 3s ttl
@@ -2246,6 +2437,7 @@ mod tests {
             note: None,
             dedupe_key: None,
             ttl_ms: None,
+            priority: PRIORITY_NORMAL,
         };
 
         assert!(!is_task_expired(&task, u128::MAX)); // Never expires
@@ -2336,6 +2528,7 @@ mod tests {
                     note: None,
                     dedupe_key: None,
                     ttl_ms: Some(5_000), // Expired: 10s elapsed > 5s ttl
+                    priority: PRIORITY_NORMAL,
                 },
                 StackTask {
                     id: Uuid::new_v4(),
@@ -2346,6 +2539,7 @@ mod tests {
                     note: None,
                     dedupe_key: None,
                     ttl_ms: Some(10_000), // Valid: 0s elapsed < 10s ttl
+                    priority: PRIORITY_NORMAL,
                 },
             ]),
             ..Default::default()
@@ -2392,6 +2586,7 @@ mod tests {
                     note: None,
                     dedupe_key: None,
                     ttl_ms: Some(5_000), // Expired
+                    priority: PRIORITY_NORMAL,
                 },
                 StackTask {
                     id: Uuid::new_v4(),
@@ -2402,6 +2597,7 @@ mod tests {
                     note: None,
                     dedupe_key: None,
                     ttl_ms: None, // No TTL
+                    priority: PRIORITY_NORMAL,
                 },
             ]),
             ..Default::default()
@@ -2431,6 +2627,7 @@ mod tests {
                     note: None,
                     dedupe_key: None,
                     ttl_ms: Some(5_000), // Expired
+                    priority: PRIORITY_NORMAL,
                 },
                 StackTask {
                     id: Uuid::new_v4(),
@@ -2441,6 +2638,7 @@ mod tests {
                     note: None,
                     dedupe_key: None,
                     ttl_ms: Some(60_000), // Not expired
+                    priority: PRIORITY_NORMAL,
                 },
             ]),
             ..Default::default()
@@ -2468,6 +2666,7 @@ mod tests {
                 note: None,
                 dedupe_key: None,
                 ttl_ms: Some(5000),
+                priority: PRIORITY_NORMAL,
             }]),
             ..Default::default()
         };
@@ -2488,5 +2687,304 @@ mod tests {
             Some(5000)
         );
         assert_eq!(task.get("expired").and_then(Value::as_bool), Some(false));
+    }
+
+    // Priority-related tests
+    #[tokio::test]
+    async fn stack_push_accepts_valid_priority() {
+        let mut state = AppState::default();
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {
+                    "function_name": "test.call",
+                    "priority": PRIORITY_HIGH
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(state.stack.len(), 1);
+
+        let task = state.stack.front().expect("task");
+        assert_eq!(task.priority, PRIORITY_HIGH);
+    }
+
+    #[tokio::test]
+    async fn stack_push_rejects_priority_above_max() {
+        let mut state = AppState::default();
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {
+                    "function_name": "test.call",
+                    "priority": MAX_PRIORITY as u64 + 1
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("priority must be <= 255"));
+        assert!(state.stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stack_push_defaults_to_normal_priority() {
+        let mut state = AppState::default();
+        let result = call_tool(
+            &mut state,
+            &json!({
+                "name": "stack_push",
+                "arguments": {
+                    "function_name": "test.call"
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        let task = state.stack.front().expect("task");
+        assert_eq!(task.priority, PRIORITY_NORMAL);
+    }
+
+    #[tokio::test]
+    async fn stack_list_includes_priority() {
+        let mut state = AppState::default();
+        state.stack.push_back(task_with_priority(PRIORITY_CRITICAL));
+
+        let result = call_tool(&mut state, &json!({"name": "stack_list"})).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+
+        let tasks = result
+            .get("tasks")
+            .and_then(Value::as_array)
+            .expect("tasks array");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].get("priority").and_then(Value::as_u64),
+            Some(PRIORITY_CRITICAL as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn stack_list_filters_by_priority() {
+        let mut state = AppState::default();
+        state.stack.push_back(task_with_priority(PRIORITY_LOW));
+        state.stack.push_back(task_with_priority(PRIORITY_NORMAL));
+        state.stack.push_back(task_with_priority(PRIORITY_HIGH));
+        state.stack.push_back(task_with_priority(PRIORITY_CRITICAL));
+
+        let result = call_tool(
+            &mut state,
+            &json!({"name": "stack_list", "arguments": {"min_priority": PRIORITY_HIGH}}),
+        )
+        .await;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        let tasks = result
+            .get("tasks")
+            .and_then(Value::as_array)
+            .expect("tasks array");
+        assert_eq!(tasks.len(), 2); // HIGH and CRITICAL
+    }
+
+    #[tokio::test]
+    async fn run_next_executes_highest_priority_first() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "low_priority".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_LOW,
+                },
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "critical_task".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_CRITICAL,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        // Run next should execute critical_task first even though low_priority was added first
+        let result = run_next(&mut state).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+
+        let executed = result
+            .get("executed")
+            .and_then(Value::as_object)
+            .expect("executed object");
+        assert_eq!(
+            executed.get("function_name").and_then(Value::as_str),
+            Some("critical_task")
+        );
+
+        // Low priority task should still be in stack
+        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.stack[0].function_name, "low_priority");
+    }
+
+    #[tokio::test]
+    async fn run_due_executes_in_priority_order() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "low".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_LOW,
+                },
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "high".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_HIGH,
+                },
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "normal".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_NORMAL,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let result = run_due(&mut state, &json!({})).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("ran").and_then(Value::as_u64), Some(3));
+
+        let results = result
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array");
+
+        // Should execute in priority order: HIGH, NORMAL, LOW
+        assert_eq!(
+            results[0].get("function_name").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            results[1].get("function_name").and_then(Value::as_str),
+            Some("normal")
+        );
+        assert_eq!(
+            results[2].get("function_name").and_then(Value::as_str),
+            Some("low")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_next_uses_lifo_within_same_priority() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            stack: VecDeque::from(vec![
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "first".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_NORMAL,
+                },
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "second".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now,
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_NORMAL,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let result = run_next(&mut state).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+
+        // LIFO within same priority: second was added last, so it executes first
+        let executed = result
+            .get("executed")
+            .and_then(Value::as_object)
+            .expect("executed object");
+        assert_eq!(
+            executed.get("function_name").and_then(Value::as_str),
+            Some("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_preserved_in_stack_save_load() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("priority-stack.json");
+
+        let mut save_state = AppState::default();
+        save_state
+            .stack
+            .push_back(task_with_priority(PRIORITY_CRITICAL));
+        save_state.stack.push_back(task_with_priority(PRIORITY_LOW));
+
+        let save_result = save_stack(
+            &save_state,
+            &json!({"path": path.to_string_lossy().to_string()}),
+        )
+        .await;
+        assert_eq!(save_result.get("ok").and_then(Value::as_bool), Some(true));
+
+        let mut load_state = AppState::default();
+        let load_result = load_stack(
+            &mut load_state,
+            &json!({"path": path.to_string_lossy().to_string()}),
+        )
+        .await;
+        assert_eq!(load_result.get("ok").and_then(Value::as_bool), Some(true));
+
+        assert_eq!(load_state.stack.len(), 2);
+        // Order preserved from save
+        assert_eq!(load_state.stack[0].priority, PRIORITY_CRITICAL);
+        assert_eq!(load_state.stack[1].priority, PRIORITY_LOW);
     }
 }
