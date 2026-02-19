@@ -168,6 +168,65 @@ struct AppMetrics {
     started_at_ms: u128,
 }
 
+/// Rate limiter for controlling execution frequency
+#[derive(Debug, Clone)]
+struct RateLimiter {
+    min_interval_ms: u64,
+    last_execution_ms: u128,
+}
+
+impl RateLimiter {
+    fn new(min_interval_ms: u64) -> Self {
+        Self {
+            min_interval_ms,
+            last_execution_ms: 0,
+        }
+    }
+
+    fn with_now(min_interval_ms: u64, now_ms: u128) -> Self {
+        Self {
+            min_interval_ms,
+            last_execution_ms: now_ms.saturating_sub(min_interval_ms as u128),
+        }
+    }
+
+    /// Check if execution is allowed and update last execution time
+    fn try_execute(&mut self, now_ms: u128) -> Option<u64> {
+        if self.min_interval_ms == 0 {
+            self.last_execution_ms = now_ms;
+            return Some(0);
+        }
+
+        let elapsed = now_ms.saturating_sub(self.last_execution_ms);
+        if elapsed >= self.min_interval_ms as u128 {
+            self.last_execution_ms = now_ms;
+            Some(0)
+        } else {
+            let wait_ms = (self.min_interval_ms as u128).saturating_sub(elapsed) as u64;
+            Some(wait_ms)
+        }
+    }
+
+    /// Calculate remaining wait time without updating state
+    fn remaining_wait(&self, now_ms: u128) -> u64 {
+        if self.min_interval_ms == 0 {
+            return 0;
+        }
+        let elapsed = now_ms.saturating_sub(self.last_execution_ms);
+        (self.min_interval_ms as u128)
+            .saturating_sub(elapsed)
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn status(&self, now_ms: u128) -> Value {
+        json!({
+            "min_interval_ms": self.min_interval_ms,
+            "last_execution_ms": self.last_execution_ms,
+            "remaining_wait_ms": self.remaining_wait(now_ms),
+        })
+    }
+}
+
 impl AppMetrics {
     fn new() -> Self {
         Self {
@@ -350,6 +409,7 @@ struct AppState {
     metrics: AppMetrics,
     history: ExecutionHistory,
     config: ServerConfig,
+    rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -358,6 +418,7 @@ impl AppState {
             stack: VecDeque::default(),
             metrics: AppMetrics::new(),
             history: ExecutionHistory::new(config.history_size),
+            rate_limiter: RateLimiter::new(config.min_exec_interval_ms),
             config,
         }
     }
@@ -373,6 +434,7 @@ impl Default for AppState {
             request_size_limit: MAX_REQUEST_SIZE_BYTES,
             enable_recovery: true,
             history_size: 1000,
+            min_exec_interval_ms: 0, // No rate limiting in tests by default
         })
     }
 }
@@ -485,6 +547,7 @@ struct ServerConfig {
     request_size_limit: usize,
     enable_recovery: bool,
     history_size: usize,
+    min_exec_interval_ms: u64,
 }
 
 impl ServerConfig {
@@ -537,6 +600,16 @@ impl ServerConfig {
             return Err("STACK_HISTORY_SIZE exceeds maximum allowed (100,000)".to_string());
         }
 
+        // Parse min execution interval (rate limiting)
+        let min_exec_interval_ms = Self::parse_u64_env("STACK_MIN_EXEC_INTERVAL_MS", 0)?;
+        if min_exec_interval_ms > 3_600_000 {
+            // Max 1 hour
+            return Err(
+                "STACK_MIN_EXEC_INTERVAL_MS exceeds maximum allowed (3,600,000 = 1 hour)"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
             shutdown_path,
             max_stack_depth,
@@ -544,6 +617,7 @@ impl ServerConfig {
             request_size_limit,
             enable_recovery,
             history_size,
+            min_exec_interval_ms,
         })
     }
 
@@ -552,6 +626,15 @@ impl ServerConfig {
             Ok(val) => val
                 .parse::<usize>()
                 .map_err(|_| format!("{} must be a positive integer", name)),
+            Err(_) => Ok(default),
+        }
+    }
+
+    fn parse_u64_env(name: &str, default: u64) -> Result<u64, String> {
+        match std::env::var(name) {
+            Ok(val) => val
+                .parse::<u64>()
+                .map_err(|_| format!("{} must be a non-negative integer", name)),
             Err(_) => Ok(default),
         }
     }
@@ -565,6 +648,7 @@ impl ServerConfig {
             "request_size_limit_mb": self.request_size_limit / (1024 * 1024),
             "enable_recovery": self.enable_recovery,
             "history_size": self.history_size,
+            "min_exec_interval_ms": self.min_exec_interval_ms,
         })
     }
 }
@@ -723,7 +807,8 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_history","description":"Query execution history for audit/debugging (most recent first)","input_schema":{"limit":"number? (max 100, default 10)","include_expired":"boolean? (default false)"}},
             {"name":"stack_clear_history","description":"Clear execution history (returns number of records removed)","input_schema":{}},
             {"name":"stack_config","description":"Get current server configuration (read-only)","input_schema":{}},
-            {"name":"health_check","description":"Health check and server metrics (includes circuit breaker status)","input_schema":{}},
+            {"name":"stack_rate_limit","description":"Get or set execution rate limiting (minimum interval between task executions). Use to protect downstream systems from overload.","input_schema":{"min_interval_ms":"number? (0 to disable, max 3600000 = 1 hour, omit to get current value)"}},
+            {"name":"health_check","description":"Health check and server metrics (includes circuit breaker and rate limiter status)","input_schema":{}},
             {"name":"metrics_export","description":"Export metrics in Prometheus/OpenMetrics format for monitoring systems","input_schema":{"format":"prometheus|openmetrics? (default: prometheus)"}},
             {"name":"circuit_status","description":"Get circuit breaker status for all tools or a specific tool","input_schema":{"tool":"string? (specific tool name, omit for all)"}},
             {"name":"circuit_reset","description":"Manually reset circuit breaker for a tool (useful after fixing downstream issues)","input_schema":{"tool":"string (required)"}}
@@ -897,7 +982,15 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
         "stack_run_next" => run_next(state).await,
         "stack_run_due" => run_due(state, &args).await,
         "stack_run_all" => {
-            let now_ms = now_unix_ms();
+            let mut now_ms = now_unix_ms();
+
+            // Check rate limiter before batch execution
+            let rate_wait_ms = state.rate_limiter.remaining_wait(now_ms);
+            if rate_wait_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(rate_wait_ms)).await;
+                now_ms = now_unix_ms();
+            }
+
             // Pre-clean expired tasks
             let expired_before = state.stack.len();
             state.stack.retain(|task| !is_task_expired(task, now_ms));
@@ -917,6 +1010,14 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
 
             let mut results = vec![];
             for task in tasks {
+                // Enforce rate limit between consecutive task executions
+                if let Some(wait_ms) = state.rate_limiter.try_execute(now_ms) {
+                    if wait_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        now_ms = now_unix_ms();
+                    }
+                }
+
                 let remaining_ms = remaining_delay_ms(&task, now_ms);
                 if remaining_ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
@@ -942,17 +1043,22 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
         "stack_cleanup_expired" => cleanup_expired(state),
         "stack_history" => query_history(state, args),
         "stack_clear_history" => clear_history(state, args),
-        "health_check" => json!({
-            "ok": true,
-            "status": "healthy",
-            "stack_depth": state.stack.len(),
-            "history_size": state.history.len(),
-            "metrics": state.metrics.summary()
-        }),
+        "health_check" => {
+            let now_ms = now_unix_ms();
+            json!({
+                "ok": true,
+                "status": "healthy",
+                "stack_depth": state.stack.len(),
+                "history_size": state.history.len(),
+                "metrics": state.metrics.summary(),
+                "rate_limiter": state.rate_limiter.status(now_ms),
+            })
+        }
         "stack_config" => json!({
             "ok": true,
             "config": state.config.summary()
         }),
+        "stack_rate_limit" => handle_rate_limit(state, args),
         "metrics_export" => export_metrics(state, &args),
         "circuit_status" => circuit_status(state, &args),
         "circuit_reset" => circuit_reset(state, &args),
@@ -1314,6 +1420,16 @@ fn executed_payload(task: StackTask, status: &str) -> Value {
 async fn run_next(state: &mut AppState) -> Value {
     let now_ms = now_unix_ms();
 
+    // Check rate limiter
+    if let Some(wait_ms) = state.rate_limiter.try_execute(now_ms) {
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
+    }
+
+    // Re-fetch time after potential rate limit wait
+    let now_ms = now_unix_ms();
+
     // Find the index of the highest priority non-expired task
     // Within same priority, prefer LIFO (higher index in VecDeque = newer = execute first)
     let mut best_idx: Option<usize> = None;
@@ -1415,7 +1531,14 @@ async fn run_due(state: &mut AppState, args: &Value) -> Value {
         return json!({"ok":true,"ran":0,"results":[],"stack_depth":0});
     }
 
-    let now_ms = now_unix_ms();
+    let mut now_ms = now_unix_ms();
+
+    // Check rate limiter before batch execution
+    let rate_wait_ms = state.rate_limiter.remaining_wait(now_ms);
+    if rate_wait_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(rate_wait_ms)).await;
+        now_ms = now_unix_ms();
+    }
 
     // First pass: identify expired and due tasks
     let mut expired_count = 0usize;
@@ -1466,8 +1589,16 @@ async fn run_due(state: &mut AppState, args: &Value) -> Value {
         }
     }
 
-    // Build results in priority order and record executions
+    // Build results in priority order, respecting rate limiting between tasks
     for (idx, _) in &due_tasks {
+        // Enforce rate limit between consecutive task executions
+        if let Some(wait_ms) = state.rate_limiter.try_execute(now_ms) {
+            if wait_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                now_ms = now_unix_ms();
+            }
+        }
+
         if let Some(&task_ref) = due_task_map.get(idx) {
             let task = task_ref.clone();
             state.history.record(&task, 0, false); // grace_ms tasks don't wait
@@ -1732,6 +1863,47 @@ fn circuit_status(state: &AppState, args: &Value) -> Value {
         "circuits": circuits,
         "open_circuits": open_circuits,
         "healthy": open_circuits.is_empty(),
+    })
+}
+
+fn handle_rate_limit(state: &mut AppState, args: &Value) -> Value {
+    let now_ms = now_unix_ms();
+
+    // If min_interval_ms is provided, update the rate limiter
+    if let Some(val) = args.get("min_interval_ms") {
+        match val.as_u64() {
+            Some(interval) => {
+                if interval > 3_600_000 {
+                    return json!({
+                        "ok": false,
+                        "error": "min_interval_ms exceeds maximum allowed (3,600,000 = 1 hour)"
+                    });
+                }
+                let old_interval = state.rate_limiter.min_interval_ms;
+                state.rate_limiter = RateLimiter::with_now(interval, now_ms);
+                return json!({
+                    "ok": true,
+                    "updated": true,
+                    "previous_min_interval_ms": old_interval,
+                    "min_interval_ms": interval,
+                    "status": state.rate_limiter.status(now_ms),
+                });
+            }
+            None => {
+                return json!({
+                    "ok": false,
+                    "error": "min_interval_ms must be a non-negative integer (0 to disable)"
+                });
+            }
+        }
+    }
+
+    // Otherwise, just return current status
+    json!({
+        "ok": true,
+        "updated": false,
+        "min_interval_ms": state.rate_limiter.min_interval_ms,
+        "status": state.rate_limiter.status(now_ms),
     })
 }
 
@@ -3703,5 +3875,222 @@ mod tests {
         // Order preserved from save
         assert_eq!(load_state.stack[0].priority, PRIORITY_CRITICAL);
         assert_eq!(load_state.stack[1].priority, PRIORITY_LOW);
+    }
+
+    // Rate limiter tests
+    #[test]
+    fn rate_limiter_allows_immediate_first_execution() {
+        let mut limiter = RateLimiter::new(100); // 100ms min interval
+        let now = 1_000_000u128;
+        let wait = limiter.try_execute(now);
+        assert_eq!(wait, Some(0));
+    }
+
+    #[test]
+    fn rate_limiter_enforces_min_interval() {
+        let mut limiter = RateLimiter::with_now(100, 1_000_000); // 100ms min interval
+        let first = limiter.try_execute(1_000_000);
+        assert_eq!(first, Some(0));
+
+        // Second execution too soon should report wait time
+        let second = limiter.try_execute(1_000_050); // 50ms later
+        assert!(second.unwrap() > 0);
+        assert!(second.unwrap() <= 100);
+    }
+
+    #[test]
+    fn rate_limiter_allows_after_interval_elapsed() {
+        let mut limiter = RateLimiter::with_now(100, 1_000_000);
+        let _ = limiter.try_execute(1_000_000);
+
+        // After 100ms+ should allow immediately
+        let next = limiter.try_execute(1_000_150); // 150ms later
+        assert_eq!(next, Some(0));
+    }
+
+    #[test]
+    fn rate_limiter_disabled_when_zero() {
+        let mut limiter = RateLimiter::new(0); // Disabled
+        let first = limiter.try_execute(1_000_000);
+        assert_eq!(first, Some(0));
+
+        let second = limiter.try_execute(1_000_001);
+        assert_eq!(second, Some(0)); // No delay when disabled
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_delays_run_next() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            rate_limiter: RateLimiter::with_now(50, now), // 50ms min interval
+            stack: VecDeque::from(vec![StackTask {
+                id: Uuid::new_v4(),
+                function_name: "test".to_string(),
+                args: json!({}),
+                delay_ms: 0,
+                enqueued_at_ms: now,
+                note: None,
+                dedupe_key: None,
+                ttl_ms: None,
+                priority: PRIORITY_NORMAL,
+            }]),
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        let _result = run_next(&mut state).await;
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        // Should complete quickly (first execution)
+        assert!(
+            elapsed < 20,
+            "First execution should be fast, took {}ms",
+            elapsed
+        );
+
+        // Add another task and run again
+        state.stack.push_back(StackTask {
+            id: Uuid::new_v4(),
+            function_name: "test2".to_string(),
+            args: json!({}),
+            delay_ms: 0,
+            enqueued_at_ms: now_unix_ms(),
+            note: None,
+            dedupe_key: None,
+            ttl_ms: None,
+            priority: PRIORITY_NORMAL,
+        });
+
+        let start2 = std::time::Instant::now();
+        let _result2 = run_next(&mut state).await;
+        let elapsed2 = start2.elapsed().as_millis() as u64;
+
+        // Second execution should be delayed by rate limiter (at least some delay)
+        // Note: exact timing is variable, but it should take longer than immediate
+        assert!(
+            elapsed2 >= 40,
+            "Second execution should be rate limited, took {}ms",
+            elapsed2
+        );
+    }
+
+    #[tokio::test]
+    async fn stack_rate_limit_get_returns_current_value() {
+        let mut state = AppState::default(); // Default has 0 (disabled)
+
+        let result = handle_rate_limit(&mut state, &json!({}));
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("updated").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            result.get("min_interval_ms").and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn stack_rate_limit_update_changes_value() {
+        let mut state = AppState::default();
+
+        let result = handle_rate_limit(&mut state, &json!({"min_interval_ms": 500}));
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("updated").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result
+                .get("previous_min_interval_ms")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            result.get("min_interval_ms").and_then(Value::as_u64),
+            Some(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn stack_rate_limit_rejects_invalid_value() {
+        let mut state = AppState::default();
+
+        let result = handle_rate_limit(&mut state, &json!({"min_interval_ms": 3_600_001}));
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn stack_rate_limit_rejects_non_number() {
+        let mut state = AppState::default();
+
+        let result = handle_rate_limit(&mut state, &json!({"min_interval_ms": "fast"}));
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("must be a non-negative integer"));
+    }
+
+    #[tokio::test]
+    async fn health_check_includes_rate_limiter_status() {
+        let mut state = AppState::default();
+        state.rate_limiter = RateLimiter::new(100);
+
+        let result = call_tool(&mut state, &json!({"name": "health_check"})).await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+
+        let rate_limiter = result.get("rate_limiter").expect("rate_limiter object");
+        assert_eq!(
+            rate_limiter.get("min_interval_ms").and_then(Value::as_u64),
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_due_respects_rate_limit_between_tasks() {
+        let now = now_unix_ms();
+        let mut state = AppState {
+            rate_limiter: RateLimiter::with_now(50, now), // 50ms between tasks
+            stack: VecDeque::from(vec![
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "first".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now - 1000, // Already due
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_HIGH,
+                },
+                StackTask {
+                    id: Uuid::new_v4(),
+                    function_name: "second".to_string(),
+                    args: json!({}),
+                    delay_ms: 0,
+                    enqueued_at_ms: now - 1000, // Already due
+                    note: None,
+                    dedupe_key: None,
+                    ttl_ms: None,
+                    priority: PRIORITY_NORMAL,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        let result = run_due(&mut state, &json!({})).await;
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("ran").and_then(Value::as_u64), Some(2));
+
+        // Should take at least 50ms due to rate limiting between 2 tasks
+        assert!(
+            elapsed >= 40,
+            "Batch execution should respect rate limits, took {}ms",
+            elapsed
+        );
     }
 }
