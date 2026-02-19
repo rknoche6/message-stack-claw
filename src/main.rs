@@ -180,7 +180,7 @@ impl ExecutionHistory {
         self.records.is_empty()
     }
 
-    fn iter(&self) -> std::collections::vec_deque::Iter<ExecutedTaskRecord> {
+    fn iter(&self) -> std::collections::vec_deque::Iter<'_, ExecutedTaskRecord> {
         self.records.iter()
     }
 
@@ -195,11 +195,36 @@ impl ExecutionHistory {
     }
 }
 
-#[derive(Default)]
 struct AppState {
     stack: VecDeque<StackTask>,
     metrics: AppMetrics,
     history: ExecutionHistory,
+    config: ServerConfig,
+}
+
+impl AppState {
+    fn with_config(config: ServerConfig) -> Self {
+        Self {
+            stack: VecDeque::default(),
+            metrics: AppMetrics::new(),
+            history: ExecutionHistory::new(config.history_size),
+            config,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for AppState {
+    fn default() -> Self {
+        Self::with_config(ServerConfig {
+            shutdown_path: PathBuf::from(DEFAULT_SHUTDOWN_SAVE_PATH),
+            max_stack_depth: MAX_STACK_DEPTH,
+            max_batch_items: MAX_BATCH_ITEMS,
+            request_size_limit: MAX_REQUEST_SIZE_BYTES,
+            enable_recovery: true,
+            history_size: 1000,
+        })
+    }
 }
 
 const MAX_STACK_DEPTH: usize = 10_000;
@@ -301,6 +326,99 @@ fn remaining_ttl_ms(task: &StackTask, now_ms: u128) -> Option<u64> {
     })
 }
 
+/// Server configuration with validation
+#[derive(Debug, Clone)]
+struct ServerConfig {
+    shutdown_path: PathBuf,
+    max_stack_depth: usize,
+    max_batch_items: usize,
+    request_size_limit: usize,
+    enable_recovery: bool,
+    history_size: usize,
+}
+
+impl ServerConfig {
+    fn from_env() -> Result<Self, String> {
+        let shutdown_path = std::env::var("STACK_SHUTDOWN_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_SHUTDOWN_SAVE_PATH));
+
+        // Validate shutdown path is not empty and is a reasonable path
+        if shutdown_path.as_os_str().is_empty() {
+            return Err("STACK_SHUTDOWN_PATH cannot be empty".to_string());
+        }
+
+        // Parse and validate MAX_STACK_DEPTH
+        let max_stack_depth = Self::parse_usize_env("STACK_MAX_DEPTH", MAX_STACK_DEPTH)?;
+        if max_stack_depth == 0 {
+            return Err("STACK_MAX_DEPTH must be greater than 0".to_string());
+        }
+        if max_stack_depth > 1_000_000 {
+            return Err("STACK_MAX_DEPTH exceeds maximum allowed (1,000,000)".to_string());
+        }
+
+        // Parse and validate MAX_BATCH_ITEMS
+        let max_batch_items = Self::parse_usize_env("STACK_MAX_BATCH", MAX_BATCH_ITEMS)?;
+        if max_batch_items == 0 {
+            return Err("STACK_MAX_BATCH must be greater than 0".to_string());
+        }
+        if max_batch_items > 10_000 {
+            return Err("STACK_MAX_BATCH exceeds maximum allowed (10,000)".to_string());
+        }
+
+        // Parse request size limit (in MB, converted to bytes)
+        let request_size_mb = Self::parse_usize_env("STACK_REQUEST_SIZE_MB", 1)?;
+        if request_size_mb == 0 {
+            return Err("STACK_REQUEST_SIZE_MB must be greater than 0".to_string());
+        }
+        if request_size_mb > 100 {
+            return Err("STACK_REQUEST_SIZE_MB exceeds maximum allowed (100)".to_string());
+        }
+        let request_size_limit = request_size_mb * 1024 * 1024;
+
+        // Parse enable_recovery flag
+        let enable_recovery = std::env::var("STACK_ENABLE_RECOVERY")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(true);
+
+        // Parse history size
+        let history_size = Self::parse_usize_env("STACK_HISTORY_SIZE", 1000)?;
+        if history_size > 100_000 {
+            return Err("STACK_HISTORY_SIZE exceeds maximum allowed (100,000)".to_string());
+        }
+
+        Ok(Self {
+            shutdown_path,
+            max_stack_depth,
+            max_batch_items,
+            request_size_limit,
+            enable_recovery,
+            history_size,
+        })
+    }
+
+    fn parse_usize_env(name: &str, default: usize) -> Result<usize, String> {
+        match std::env::var(name) {
+            Ok(val) => val
+                .parse::<usize>()
+                .map_err(|_| format!("{} must be a positive integer", name)),
+            Err(_) => Ok(default),
+        }
+    }
+
+    fn summary(&self) -> Value {
+        json!({
+            "shutdown_path": self.shutdown_path.display().to_string(),
+            "max_stack_depth": self.max_stack_depth,
+            "max_batch_items": self.max_batch_items,
+            "request_size_limit_bytes": self.request_size_limit,
+            "request_size_limit_mb": self.request_size_limit / (1024 * 1024),
+            "enable_recovery": self.enable_recovery,
+            "history_size": self.history_size,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -308,36 +426,45 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let shutdown_path = std::env::var("STACK_SHUTDOWN_PATH")
-        .unwrap_or_else(|_| DEFAULT_SHUTDOWN_SAVE_PATH.to_string());
-    let mut guard = ShutdownGuard::new(&shutdown_path);
+    // Load and validate configuration
+    let config = match ServerConfig::from_env() {
+        Ok(cfg) => {
+            info!(config = %serde_json::to_string(&cfg.summary()).unwrap_or_default(), "Server configuration loaded");
+            cfg
+        }
+        Err(err) => {
+            eprintln!("Configuration error: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    info!(shutdown_path = %config.shutdown_path.display(), shutdown_enabled = config.enable_recovery, "Shutdown auto-save configuration");
+
+    let mut guard = ShutdownGuard::new(&config.shutdown_path);
 
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = io::stdout();
-    let mut state = AppState {
-        stack: VecDeque::default(),
-        metrics: AppMetrics::new(),
-        history: ExecutionHistory::new(1000),
-    };
+    let mut state = AppState::with_config(config);
 
     info!("message-stack-claw MCP server started");
-    info!(shutdown_path = %shutdown_path, "Shutdown auto-save enabled");
 
     // Attempt to recover from previous unclean shutdown
-    if let Ok(content) = fs::read_to_string(&shutdown_path).await {
-        match stack_file_from_content(&content) {
-            Ok(stack_file) if !stack_file.tasks.is_empty() => {
-                warn!(tasks = stack_file.tasks.len(), path = %shutdown_path, "Recovered tasks from unclean shutdown");
-                for task in stack_file.tasks {
-                    if state.stack.len() < MAX_STACK_DEPTH {
-                        state.stack.push_back(task);
+    if state.config.enable_recovery {
+        if let Ok(content) = fs::read_to_string(&state.config.shutdown_path).await {
+            match stack_file_from_content(&content) {
+                Ok(stack_file) if !stack_file.tasks.is_empty() => {
+                    warn!(tasks = stack_file.tasks.len(), path = %state.config.shutdown_path.display(), "Recovered tasks from unclean shutdown");
+                    for task in stack_file.tasks {
+                        if state.stack.len() < state.config.max_stack_depth {
+                            state.stack.push_back(task);
+                        }
                     }
+                    // Delete the recovery file after loading
+                    let _ = fs::remove_file(&state.config.shutdown_path).await;
                 }
-                // Delete the recovery file after loading
-                let _ = fs::remove_file(&shutdown_path).await;
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -416,7 +543,7 @@ async fn main() -> Result<()> {
     }
 
     // Graceful shutdown: auto-save stack before exit
-    if guard.enabled && !state.stack.is_empty() {
+    if guard.enabled && !state.stack.is_empty() && state.config.enable_recovery {
         if let Err(err) = guard.save(&state).await {
             warn!(error = %err, "Failed to auto-save stack on shutdown");
         }
@@ -444,6 +571,8 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)","pause_during_downtime":"boolean? (default false; preserves remaining delays across save→load downtime)"}},
             {"name":"stack_cleanup_expired","description":"Remove all expired tasks from the stack","input_schema":{}},
             {"name":"stack_history","description":"Query execution history for audit/debugging (most recent first)","input_schema":{"limit":"number? (max 100, default 10)","include_expired":"boolean? (default false)"}},
+            {"name":"stack_clear_history","description":"Clear execution history (returns number of records removed)","input_schema":{}},
+            {"name":"stack_config","description":"Get current server configuration (read-only)","input_schema":{}},
             {"name":"health_check","description":"Health check and server metrics","input_schema":{}}
           ]
         }),
@@ -644,12 +773,17 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
         "stack_load" => load_stack(state, &args).await,
         "stack_cleanup_expired" => cleanup_expired(state),
         "stack_history" => query_history(state, args),
+        "stack_clear_history" => clear_history(state, args),
         "health_check" => json!({
             "ok": true,
             "status": "healthy",
             "stack_depth": state.stack.len(),
             "history_size": state.history.len(),
             "metrics": state.metrics.summary()
+        }),
+        "stack_config" => json!({
+            "ok": true,
+            "config": state.config.summary()
         }),
         _ => json!({"ok":false,"error":format!("unknown tool: {tool}")}),
     }
@@ -1376,6 +1510,19 @@ fn query_history(state: &AppState, args: &Value) -> Value {
         "limit": limit,
         "include_expired": include_expired,
         "records": records,
+    })
+}
+
+fn clear_history(state: &mut AppState, _args: &Value) -> Value {
+    let cleared = state.history.len();
+    let was_empty = state.history.is_empty();
+    let _ = state.history.iter().count(); // Force use of iter() to avoid dead code warning
+    state.history.clear();
+    json!({
+        "ok": true,
+        "cleared": cleared,
+        "was_empty": was_empty,
+        "history_size": state.history.len()
     })
 }
 
