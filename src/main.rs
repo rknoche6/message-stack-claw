@@ -573,7 +573,8 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_history","description":"Query execution history for audit/debugging (most recent first)","input_schema":{"limit":"number? (max 100, default 10)","include_expired":"boolean? (default false)"}},
             {"name":"stack_clear_history","description":"Clear execution history (returns number of records removed)","input_schema":{}},
             {"name":"stack_config","description":"Get current server configuration (read-only)","input_schema":{}},
-            {"name":"health_check","description":"Health check and server metrics","input_schema":{}}
+            {"name":"health_check","description":"Health check and server metrics","input_schema":{}},
+            {"name":"metrics_export","description":"Export metrics in Prometheus/OpenMetrics format for monitoring systems","input_schema":{"format":"prometheus|openmetrics? (default: prometheus)"}}
           ]
         }),
         "tools/call" => call_tool(state, &req.params).await,
@@ -785,6 +786,7 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
             "ok": true,
             "config": state.config.summary()
         }),
+        "metrics_export" => export_metrics(state, &args),
         _ => json!({"ok":false,"error":format!("unknown tool: {tool}")}),
     }
 }
@@ -1524,6 +1526,173 @@ fn clear_history(state: &mut AppState, _args: &Value) -> Value {
         "was_empty": was_empty,
         "history_size": state.history.len()
     })
+}
+
+/// Export metrics in Prometheus/OpenMetrics format for monitoring systems
+fn export_metrics(state: &AppState, args: &Value) -> Value {
+    let format_type = args
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("prometheus");
+
+    if format_type != "prometheus" && format_type != "openmetrics" {
+        return json!({
+            "ok": false,
+            "error": "format must be one of: prometheus, openmetrics"
+        });
+    }
+
+    let now_ms = now_unix_ms();
+    let mut output = String::with_capacity(2048);
+
+    // Helper to write lines
+    macro_rules! push_line {
+        ($($arg:tt)*) => {
+            output.push_str(&std::fmt::format(format_args!($($arg)*)));
+            output.push('\n');
+        };
+    }
+
+    // Server info
+    push_line!("# HELP message_stack_claw_info Server version and build information");
+    push_line!("# TYPE message_stack_claw_info gauge");
+    push_line!("message_stack_claw_info{{version=\"0.1.0\"}} 1");
+    output.push('\n');
+
+    // Stack depth gauge
+    push_line!("# HELP message_stack_claw_stack_depth Number of tasks currently queued");
+    push_line!("# TYPE message_stack_claw_stack_depth gauge");
+    push_line!("message_stack_claw_stack_depth {}", state.stack.len());
+    output.push('\n');
+
+    // History size gauge
+    push_line!("# HELP message_stack_claw_history_size Number of records in execution history");
+    push_line!("# TYPE message_stack_claw_history_size gauge");
+    push_line!("message_stack_claw_history_size {}", state.history.len());
+    output.push('\n');
+
+    // Uptime gauge (in seconds)
+    let uptime_secs = state.metrics.uptime_ms() / 1000;
+    push_line!("# HELP message_stack_claw_uptime_seconds Server uptime in seconds");
+    push_line!("# TYPE message_stack_claw_uptime_seconds counter");
+    push_line!("message_stack_claw_uptime_seconds {}", uptime_secs);
+    output.push('\n');
+
+    // Total requests counter
+    push_line!("# HELP message_stack_claw_requests_total Total number of tool calls");
+    push_line!("# TYPE message_stack_claw_requests_total counter");
+    push_line!(
+        "message_stack_claw_requests_total {}",
+        state.metrics.requests_total
+    );
+    output.push('\n');
+
+    // Tool-specific metrics
+    push_line!("# HELP message_stack_claw_tool_calls_total Total calls per tool");
+    push_line!("# TYPE message_stack_claw_tool_calls_total counter");
+    for (name, metrics) in &state.metrics.tools {
+        push_line!(
+            "message_stack_claw_tool_calls_total{{tool=\"{}\"}} {}",
+            escape_label(name),
+            metrics.call_count
+        );
+    }
+    output.push('\n');
+
+    // Tool errors
+    push_line!("# HELP message_stack_claw_tool_errors_total Total errors per tool");
+    push_line!("# TYPE message_stack_claw_tool_errors_total counter");
+    for (name, metrics) in &state.metrics.tools {
+        push_line!(
+            "message_stack_claw_tool_errors_total{{tool=\"{}\"}} {}",
+            escape_label(name),
+            metrics.error_count
+        );
+    }
+    output.push('\n');
+
+    // Tool duration (total_ms)
+    push_line!("# HELP message_stack_claw_tool_duration_ms_total Total duration per tool in ms");
+    push_line!("# TYPE message_stack_claw_tool_duration_ms_total counter");
+    for (name, metrics) in &state.metrics.tools {
+        push_line!(
+            "message_stack_claw_tool_duration_ms_total{{tool=\"{}\"}} {}",
+            escape_label(name),
+            metrics.total_duration_ms
+        );
+    }
+    output.push('\n');
+
+    // Task priority distribution
+    push_line!("# HELP message_stack_claw_tasks_by_priority Number of tasks by priority level");
+    push_line!("# TYPE message_stack_claw_tasks_by_priority gauge");
+    let mut priority_counts: std::collections::HashMap<TaskPriority, usize> =
+        std::collections::HashMap::new();
+    for task in &state.stack {
+        *priority_counts.entry(task.priority).or_insert(0) += 1;
+    }
+    for (priority, count) in priority_counts {
+        push_line!(
+            "message_stack_claw_tasks_by_priority{{priority=\"{}\"}} {}",
+            priority,
+            count
+        );
+    }
+    output.push('\n');
+
+    // Tasks with TTL vs without
+    let with_ttl = state.stack.iter().filter(|t| t.ttl_ms.is_some()).count();
+    let without_ttl = state.stack.len() - with_ttl;
+    push_line!("# HELP message_stack_claw_tasks_with_ttl Number of tasks with TTL set");
+    push_line!("# TYPE message_stack_claw_tasks_with_ttl gauge");
+    push_line!("message_stack_claw_tasks_with_ttl {}", with_ttl);
+    output.push('\n');
+
+    push_line!("# HELP message_stack_claw_tasks_without_ttl Number of tasks without TTL");
+    push_line!("# TYPE message_stack_claw_tasks_without_ttl gauge");
+    push_line!("message_stack_claw_tasks_without_ttl {}", without_ttl);
+    output.push('\n');
+
+    // Expired tasks in stack
+    let expired_count = state
+        .stack
+        .iter()
+        .filter(|t| is_task_expired(t, now_ms))
+        .count();
+    push_line!("# HELP message_stack_claw_tasks_expired Number of expired tasks in stack");
+    push_line!("# TYPE message_stack_claw_tasks_expired gauge");
+    push_line!("message_stack_claw_tasks_expired {}", expired_count);
+    output.push('\n');
+
+    // Ready to execute (past delay)
+    let ready_count = state
+        .stack
+        .iter()
+        .filter(|t| remaining_delay_ms(t, now_ms) == 0 && !is_task_expired(t, now_ms))
+        .count();
+    push_line!("# HELP message_stack_claw_tasks_ready Number of tasks ready to execute (past delay, not expired)");
+    push_line!("# TYPE message_stack_claw_tasks_ready gauge");
+    push_line!("message_stack_claw_tasks_ready {}", ready_count);
+    output.push('\n');
+
+    // Timestamp
+    push_line!("# HELP message_stack_claw_export_timestamp_ms Export timestamp in milliseconds");
+    push_line!("# TYPE message_stack_claw_export_timestamp_ms gauge");
+    push_line!("message_stack_claw_export_timestamp_ms {}", now_ms);
+
+    json!({
+        "ok": true,
+        "format": format_type,
+        "exported_at_ms": now_ms,
+        "metrics": output
+    })
+}
+
+/// Escape special characters in Prometheus label values
+fn escape_label(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn stack_path_from_args(args: &Value) -> String {
