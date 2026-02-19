@@ -118,10 +118,88 @@ impl AppMetrics {
     }
 }
 
+/// A record of an executed task for history/audit purposes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExecutedTaskRecord {
+    id: Uuid,
+    function_name: String,
+    args: Value,
+    note: Option<String>,
+    dedupe_key: Option<String>,
+    priority: TaskPriority,
+    delay_ms: u64,
+    enqueued_at_ms: u128,
+    executed_at_ms: u128,
+    waited_ms: u64,
+    ttl_ms: Option<u64>,
+    expired: bool,
+}
+
+/// Bounded history buffer for executed tasks
+#[derive(Debug, Default)]
+struct ExecutionHistory {
+    records: VecDeque<ExecutedTaskRecord>,
+    max_size: usize,
+}
+
+impl ExecutionHistory {
+    fn new(max_size: usize) -> Self {
+        Self {
+            records: VecDeque::with_capacity(max_size.min(1000)),
+            max_size: max_size.max(1).min(10_000), // Clamp between 1 and 10k
+        }
+    }
+
+    fn record(&mut self, task: &StackTask, waited_ms: u64, expired: bool) {
+        let record = ExecutedTaskRecord {
+            id: task.id,
+            function_name: task.function_name.clone(),
+            args: task.args.clone(),
+            note: task.note.clone(),
+            dedupe_key: task.dedupe_key.clone(),
+            priority: task.priority,
+            delay_ms: task.delay_ms,
+            enqueued_at_ms: task.enqueued_at_ms,
+            executed_at_ms: now_unix_ms(),
+            waited_ms,
+            ttl_ms: task.ttl_ms,
+            expired,
+        };
+
+        if self.records.len() >= self.max_size {
+            self.records.pop_front();
+        }
+        self.records.push_back(record);
+    }
+
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    fn iter(&self) -> std::collections::vec_deque::Iter<ExecutedTaskRecord> {
+        self.records.iter()
+    }
+
+    fn clear(&mut self) {
+        self.records.clear();
+    }
+
+    /// Get recent records with optional limit
+    fn recent(&self, limit: Option<usize>) -> Vec<&ExecutedTaskRecord> {
+        let limit = limit.unwrap_or(self.max_size).min(self.max_size);
+        self.records.iter().rev().take(limit).collect()
+    }
+}
+
 #[derive(Default)]
 struct AppState {
     stack: VecDeque<StackTask>,
     metrics: AppMetrics,
+    history: ExecutionHistory,
 }
 
 const MAX_STACK_DEPTH: usize = 10_000;
@@ -240,6 +318,7 @@ async fn main() -> Result<()> {
     let mut state = AppState {
         stack: VecDeque::default(),
         metrics: AppMetrics::new(),
+        history: ExecutionHistory::new(1000),
     };
 
     info!("message-stack-claw MCP server started");
@@ -364,6 +443,7 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_save","description":"Persist current stack to disk","input_schema":{"path":"string?"}},
             {"name":"stack_load","description":"Load stack from disk (replace or append)","input_schema":{"path":"string?","mode":"replace|append?","dedupe_ids":"boolean? (default true when append)","pause_during_downtime":"boolean? (default false; preserves remaining delays across save→load downtime)"}},
             {"name":"stack_cleanup_expired","description":"Remove all expired tasks from the stack","input_schema":{}},
+            {"name":"stack_history","description":"Query execution history for audit/debugging (most recent first)","input_schema":{"limit":"number? (max 100, default 10)","include_expired":"boolean? (default false)"}},
             {"name":"health_check","description":"Health check and server metrics","input_schema":{}}
           ]
         }),
@@ -544,6 +624,7 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
                 if remaining_ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
                 }
+                state.history.record(&task, remaining_ms, false);
                 results.push(json!({
                     "ok": true,
                     "waited_ms": remaining_ms,
@@ -562,10 +643,12 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
         "stack_save" => save_stack(state, &args).await,
         "stack_load" => load_stack(state, &args).await,
         "stack_cleanup_expired" => cleanup_expired(state),
+        "stack_history" => query_history(state, args),
         "health_check" => json!({
             "ok": true,
             "status": "healthy",
             "stack_depth": state.stack.len(),
+            "history_size": state.history.len(),
             "metrics": state.metrics.summary()
         }),
         _ => json!({"ok":false,"error":format!("unknown tool: {tool}")}),
@@ -955,6 +1038,9 @@ async fn run_next(state: &mut AppState) -> Value {
             tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
         }
 
+        // Record execution in history
+        state.history.record(&task, remaining_ms, false);
+
         return json!({
           "ok": true,
           "waited_ms": remaining_ms,
@@ -1075,10 +1161,12 @@ async fn run_due(state: &mut AppState, args: &Value) -> Value {
         }
     }
 
-    // Build results in priority order
+    // Build results in priority order and record executions
     for (idx, _) in &due_tasks {
         if let Some(&task_ref) = due_task_map.get(idx) {
-            results.push(executed_payload(task_ref.clone(), "executed_due"));
+            let task = task_ref.clone();
+            state.history.record(&task, 0, false); // grace_ms tasks don't wait
+            results.push(executed_payload(task, "executed_due"));
         }
     }
 
@@ -1244,6 +1332,50 @@ fn cleanup_expired(state: &mut AppState) -> Value {
         "tasks": removed,
         "stack_depth": state.stack.len(),
         "now_ms": now_ms
+    })
+}
+
+fn query_history(state: &AppState, args: &Value) -> Value {
+    let limit = match arg_u64(args, "limit") {
+        Ok(v) => v.map(|l| (l as usize).min(100).max(1)).unwrap_or(10),
+        Err(err) => return json!({"ok":false,"error":err}),
+    };
+
+    let include_expired = args
+        .get("include_expired")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let records: Vec<Value> = state
+        .history
+        .recent(Some(limit))
+        .into_iter()
+        .filter(|r| include_expired || !r.expired)
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "function_name": r.function_name,
+                "args": r.args,
+                "note": r.note,
+                "dedupe_key": r.dedupe_key,
+                "priority": r.priority,
+                "delay_ms": r.delay_ms,
+                "enqueued_at_ms": r.enqueued_at_ms,
+                "executed_at_ms": r.executed_at_ms,
+                "waited_ms": r.waited_ms,
+                "ttl_ms": r.ttl_ms,
+                "expired": r.expired,
+            })
+        })
+        .collect();
+
+    json!({
+        "ok": true,
+        "count": records.len(),
+        "total_history_size": state.history.len(),
+        "limit": limit,
+        "include_expired": include_expired,
+        "records": records,
     })
 }
 
