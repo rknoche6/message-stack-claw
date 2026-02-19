@@ -52,6 +52,107 @@ struct RpcResponse {
     result: Value,
 }
 
+/// Circuit breaker states for resilient tool execution
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CircuitState {
+    Closed,   // Normal operation
+    Open,     // Failing, rejecting requests
+    HalfOpen, // Testing if recovered
+}
+
+#[derive(Debug, Clone)]
+struct CircuitBreaker {
+    state: CircuitState,
+    failure_threshold: u32,
+    success_threshold: u32,
+    timeout_ms: u64,
+    failures: u32,
+    successes: u32,
+    last_failure_ms: u128,
+}
+
+impl CircuitBreaker {
+    fn new(failure_threshold: u32, success_threshold: u32, timeout_ms: u64) -> Self {
+        Self {
+            state: CircuitState::Closed,
+            failure_threshold,
+            success_threshold,
+            timeout_ms,
+            failures: 0,
+            successes: 0,
+            last_failure_ms: 0,
+        }
+    }
+
+    fn default_config() -> Self {
+        Self::new(5, 3, 30_000) // 5 failures, 3 successes, 30s timeout
+    }
+
+    fn can_execute(&mut self, now_ms: u128) -> bool {
+        match self.state {
+            CircuitState::Closed => true,
+            CircuitState::Open => {
+                let elapsed = now_ms.saturating_sub(self.last_failure_ms);
+                if elapsed >= self.timeout_ms as u128 {
+                    self.state = CircuitState::HalfOpen;
+                    self.successes = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            CircuitState::HalfOpen => true,
+        }
+    }
+
+    fn record_success(&mut self) {
+        match self.state {
+            CircuitState::HalfOpen => {
+                self.successes += 1;
+                if self.successes >= self.success_threshold {
+                    self.state = CircuitState::Closed;
+                    self.failures = 0;
+                    self.successes = 0;
+                }
+            }
+            CircuitState::Closed => {
+                self.failures = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn record_failure(&mut self, now_ms: u128) {
+        self.failures += 1;
+        self.last_failure_ms = now_ms;
+
+        match self.state {
+            CircuitState::HalfOpen => {
+                self.state = CircuitState::Open;
+            }
+            CircuitState::Closed => {
+                if self.failures >= self.failure_threshold {
+                    self.state = CircuitState::Open;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn status(&self) -> Value {
+        json!({
+            "state": match self.state {
+                CircuitState::Closed => "closed",
+                CircuitState::Open => "open",
+                CircuitState::HalfOpen => "half_open",
+            },
+            "failures": self.failures,
+            "successes": self.successes,
+            "last_failure_ms": self.last_failure_ms,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ToolMetrics {
     call_count: u64,
@@ -63,6 +164,7 @@ struct ToolMetrics {
 struct AppMetrics {
     requests_total: u64,
     tools: HashMap<String, ToolMetrics>,
+    circuits: HashMap<String, CircuitBreaker>,
     started_at_ms: u128,
 }
 
@@ -82,6 +184,53 @@ impl AppMetrics {
         if is_error {
             entry.error_count += 1;
         }
+    }
+
+    fn get_or_create_circuit(&mut self, tool_name: &str) -> &mut CircuitBreaker {
+        self.circuits
+            .entry(tool_name.to_string())
+            .or_insert_with(CircuitBreaker::default_config)
+    }
+
+    fn check_circuit(&mut self, tool_name: &str) -> Option<Value> {
+        let now_ms = now_unix_ms();
+        let circuit = self.get_or_create_circuit(tool_name);
+
+        if !circuit.can_execute(now_ms) {
+            let remaining_ms = circuit
+                .timeout_ms
+                .saturating_sub((now_ms.saturating_sub(circuit.last_failure_ms)) as u64);
+            return Some(json!({
+                "ok": false,
+                "error": format!("circuit breaker open for tool '{}': too many failures, try again in {}ms", tool_name, remaining_ms),
+                "circuit_breaker": circuit.status(),
+            }));
+        }
+        None
+    }
+
+    fn record_circuit_success(&mut self, tool_name: &str) {
+        if let Some(circuit) = self.circuits.get_mut(tool_name) {
+            circuit.record_success();
+        } else {
+            // Initialize with success
+            let mut cb = CircuitBreaker::default_config();
+            cb.record_success();
+            self.circuits.insert(tool_name.to_string(), cb);
+        }
+    }
+
+    fn record_circuit_failure(&mut self, tool_name: &str) {
+        let now_ms = now_unix_ms();
+        let circuit = self.get_or_create_circuit(tool_name);
+        circuit.record_failure(now_ms);
+    }
+
+    fn circuit_summary(&self) -> HashMap<String, Value> {
+        self.circuits
+            .iter()
+            .map(|(name, cb)| (name.clone(), cb.status()))
+            .collect()
     }
 
     fn uptime_ms(&self) -> u128 {
@@ -114,6 +263,7 @@ impl AppMetrics {
             "requests_total": self.requests_total,
             "uptime_ms": self.uptime_ms(),
             "tools": tools,
+            "circuit_breakers": self.circuit_summary(),
         })
     }
 }
@@ -573,8 +723,10 @@ async fn handle_request(state: &mut AppState, req: &RpcRequest) -> Value {
             {"name":"stack_history","description":"Query execution history for audit/debugging (most recent first)","input_schema":{"limit":"number? (max 100, default 10)","include_expired":"boolean? (default false)"}},
             {"name":"stack_clear_history","description":"Clear execution history (returns number of records removed)","input_schema":{}},
             {"name":"stack_config","description":"Get current server configuration (read-only)","input_schema":{}},
-            {"name":"health_check","description":"Health check and server metrics","input_schema":{}},
-            {"name":"metrics_export","description":"Export metrics in Prometheus/OpenMetrics format for monitoring systems","input_schema":{"format":"prometheus|openmetrics? (default: prometheus)"}}
+            {"name":"health_check","description":"Health check and server metrics (includes circuit breaker status)","input_schema":{}},
+            {"name":"metrics_export","description":"Export metrics in Prometheus/OpenMetrics format for monitoring systems","input_schema":{"format":"prometheus|openmetrics? (default: prometheus)"}},
+            {"name":"circuit_status","description":"Get circuit breaker status for all tools or a specific tool","input_schema":{"tool":"string? (specific tool name, omit for all)"}},
+            {"name":"circuit_reset","description":"Manually reset circuit breaker for a tool (useful after fixing downstream issues)","input_schema":{"tool":"string (required)"}}
           ]
         }),
         "tools/call" => call_tool(state, &req.params).await,
@@ -592,11 +744,26 @@ async fn call_tool(state: &mut AppState, params: &Value) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    // Check circuit breaker before executing
+    if let Some(circuit_error) = state.metrics.check_circuit(tool) {
+        return circuit_error;
+    }
+
     let start_ms = now_unix_ms();
     let result = call_tool_inner(state, tool, &args).await;
     let duration_ms = (now_unix_ms() - start_ms) as u64;
     let is_error = result.get("ok").and_then(Value::as_bool) == Some(false);
+
+    // Record metrics
     state.metrics.record_tool_call(tool, duration_ms, is_error);
+
+    // Update circuit breaker
+    if is_error {
+        state.metrics.record_circuit_failure(tool);
+    } else {
+        state.metrics.record_circuit_success(tool);
+    }
+
     result
 }
 
@@ -787,6 +954,8 @@ async fn call_tool_inner(state: &mut AppState, tool: &str, args: &Value) -> Valu
             "config": state.config.summary()
         }),
         "metrics_export" => export_metrics(state, &args),
+        "circuit_status" => circuit_status(state, &args),
+        "circuit_reset" => circuit_reset(state, &args),
         _ => json!({"ok":false,"error":format!("unknown tool: {tool}")}),
     }
 }
@@ -1528,6 +1697,76 @@ fn clear_history(state: &mut AppState, _args: &Value) -> Value {
     })
 }
 
+fn circuit_status(state: &AppState, args: &Value) -> Value {
+    let tool_filter = args.get("tool").and_then(Value::as_str);
+
+    let circuits: HashMap<String, Value> = match tool_filter {
+        Some(tool) => {
+            let mut map = HashMap::new();
+            if let Some(cb) = state.metrics.circuits.get(tool) {
+                map.insert(tool.to_string(), cb.status());
+            } else {
+                map.insert(
+                    tool.to_string(),
+                    json!({"state": "closed", "note": "no activity yet"}),
+                );
+            }
+            map
+        }
+        None => state.metrics.circuit_summary(),
+    };
+
+    let open_circuits: Vec<String> = circuits
+        .iter()
+        .filter(|(_, v)| {
+            v.get("state")
+                .and_then(Value::as_str)
+                .map(|s| s == "open")
+                .unwrap_or(false)
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    json!({
+        "ok": true,
+        "circuits": circuits,
+        "open_circuits": open_circuits,
+        "healthy": open_circuits.is_empty(),
+    })
+}
+
+fn circuit_reset(state: &mut AppState, args: &Value) -> Value {
+    let tool = match args.get("tool").and_then(Value::as_str) {
+        Some(t) if !t.is_empty() => t,
+        _ => return json!({"ok": false, "error": "tool parameter is required"}),
+    };
+
+    if let Some(circuit) = state.metrics.circuits.get_mut(tool) {
+        let previous_state = circuit.state;
+        circuit.state = CircuitState::Closed;
+        circuit.failures = 0;
+        circuit.successes = 0;
+
+        json!({
+            "ok": true,
+            "tool": tool,
+            "previous_state": match previous_state {
+                CircuitState::Closed => "closed",
+                CircuitState::Open => "open",
+                CircuitState::HalfOpen => "half_open",
+            },
+            "current_state": "closed",
+            "message": format!("Circuit breaker for '{}' has been reset", tool),
+        })
+    } else {
+        json!({
+            "ok": true,
+            "tool": tool,
+            "note": "no circuit breaker found (tool has not been used yet)",
+        })
+    }
+}
+
 /// Export metrics in Prometheus/OpenMetrics format for monitoring systems
 fn export_metrics(state: &AppState, args: &Value) -> Value {
     let format_type = args
@@ -1619,6 +1858,36 @@ fn export_metrics(state: &AppState, args: &Value) -> Value {
             "message_stack_claw_tool_duration_ms_total{{tool=\"{}\"}} {}",
             escape_label(name),
             metrics.total_duration_ms
+        );
+    }
+    output.push('\n');
+
+    // Circuit breaker states
+    push_line!("# HELP message_stack_claw_circuit_breaker_state Circuit breaker state (0=closed, 1=half_open, 2=open)");
+    push_line!("# TYPE message_stack_claw_circuit_breaker_state gauge");
+    for (tool, circuit) in &state.metrics.circuits {
+        let state_val = match circuit.state {
+            CircuitState::Closed => 0,
+            CircuitState::HalfOpen => 1,
+            CircuitState::Open => 2,
+        };
+        push_line!(
+            "message_stack_claw_circuit_breaker_state{{tool=\"{}\"}} {}",
+            escape_label(tool),
+            state_val
+        );
+    }
+    output.push('\n');
+
+    push_line!(
+        "# HELP message_stack_claw_circuit_breaker_failures Circuit breaker consecutive failures"
+    );
+    push_line!("# TYPE message_stack_claw_circuit_breaker_failures gauge");
+    for (tool, circuit) in &state.metrics.circuits {
+        push_line!(
+            "message_stack_claw_circuit_breaker_failures{{tool=\"{}\"}} {}",
+            escape_label(tool),
+            circuit.failures
         );
     }
     output.push('\n');
