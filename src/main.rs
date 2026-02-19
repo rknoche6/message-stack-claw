@@ -166,6 +166,8 @@ struct AppMetrics {
     tools: HashMap<String, ToolMetrics>,
     circuits: HashMap<String, CircuitBreaker>,
     started_at_ms: u128,
+    /// Count of tasks automatically cleaned up by background task
+    auto_cleaned_count: u64,
 }
 
 /// Rate limiter for controlling execution frequency
@@ -231,8 +233,13 @@ impl AppMetrics {
     fn new() -> Self {
         Self {
             started_at_ms: now_unix_ms(),
+            auto_cleaned_count: 0,
             ..Default::default()
         }
+    }
+
+    fn record_auto_cleaned(&mut self, count: u64) {
+        self.auto_cleaned_count += count;
     }
 
     fn record_tool_call(&mut self, tool_name: &str, duration_ms: u64, is_error: bool) {
@@ -323,6 +330,7 @@ impl AppMetrics {
             "uptime_ms": self.uptime_ms(),
             "tools": tools,
             "circuit_breakers": self.circuit_summary(),
+            "auto_cleaned_count": self.auto_cleaned_count,
         })
     }
 }
@@ -435,6 +443,7 @@ impl Default for AppState {
             enable_recovery: true,
             history_size: 1000,
             min_exec_interval_ms: 0, // No rate limiting in tests by default
+            cleanup_interval_sec: 0, // Disabled in tests by default
         })
     }
 }
@@ -548,6 +557,8 @@ struct ServerConfig {
     enable_recovery: bool,
     history_size: usize,
     min_exec_interval_ms: u64,
+    /// Interval in seconds for automatic expired task cleanup (0 = disabled)
+    cleanup_interval_sec: u64,
 }
 
 impl ServerConfig {
@@ -610,6 +621,16 @@ impl ServerConfig {
             );
         }
 
+        // Parse cleanup interval for automatic expired task cleanup
+        let cleanup_interval_sec = Self::parse_u64_env("STACK_CLEANUP_INTERVAL_SEC", 300)?;
+        if cleanup_interval_sec > 86_400 {
+            // Max 24 hours
+            return Err(
+                "STACK_CLEANUP_INTERVAL_SEC exceeds maximum allowed (86,400 = 24 hours)"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
             shutdown_path,
             max_stack_depth,
@@ -618,6 +639,7 @@ impl ServerConfig {
             enable_recovery,
             history_size,
             min_exec_interval_ms,
+            cleanup_interval_sec,
         })
     }
 
@@ -649,6 +671,7 @@ impl ServerConfig {
             "enable_recovery": self.enable_recovery,
             "history_size": self.history_size,
             "min_exec_interval_ms": self.min_exec_interval_ms,
+            "cleanup_interval_sec": self.cleanup_interval_sec,
         })
     }
 }
@@ -719,11 +742,58 @@ async fn main() -> Result<()> {
         shutdown_clone.store(true, Ordering::SeqCst);
     });
 
-    while let Some(line) = lines.next_line().await? {
+    // Setup cleanup channel if auto-cleanup is enabled
+    let mut cleanup_rx = if state.config.cleanup_interval_sec > 0 {
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+        let interval_sec = state.config.cleanup_interval_sec;
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_sec));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Some(rx)
+    } else {
+        None
+    };
+
+    loop {
+        // Check for shutdown before waiting for next event
         if shutdown_requested.load(Ordering::SeqCst) {
             info!("Shutdown requested, completing current request...");
             break;
         }
+
+        // Use select! to handle either stdin input or cleanup tick
+        let line = tokio::select! {
+            maybe_line = lines.next_line() => match maybe_line {
+                Ok(Some(l)) => l,
+                Ok(None) => break, // EOF
+                Err(e) => return Err(e.into()),
+            },
+            _ = async {
+                match cleanup_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Run automatic cleanup
+                let now_ms = now_unix_ms();
+                let before_count = state.stack.len();
+                state.stack.retain(|task| !is_task_expired(task, now_ms));
+                let cleaned = before_count.saturating_sub(state.stack.len()) as u64;
+                if cleaned > 0 {
+                    state.metrics.record_auto_cleaned(cleaned);
+                    info!(cleaned, before_count, after_count = state.stack.len(), "Auto-cleaned expired tasks");
+                }
+                continue;
+            }
+        };
 
         if line.trim().is_empty() {
             continue;
@@ -4092,5 +4162,47 @@ mod tests {
             "Batch execution should respect rate limits, took {}ms",
             elapsed
         );
+    }
+
+    #[test]
+    fn metrics_tracks_auto_cleaned_count() {
+        let mut state = AppState::default();
+
+        // Initially should be zero
+        assert_eq!(state.metrics.auto_cleaned_count, 0);
+
+        // Simulate some auto-cleaned tasks
+        state.metrics.record_auto_cleaned(5);
+        assert_eq!(state.metrics.auto_cleaned_count, 5);
+
+        state.metrics.record_auto_cleaned(3);
+        assert_eq!(state.metrics.auto_cleaned_count, 8);
+
+        // Check summary includes the count
+        let summary = state.metrics.summary();
+        assert_eq!(
+            summary.get("auto_cleaned_count").and_then(Value::as_u64),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn config_parses_cleanup_interval() {
+        // Test default value
+        let config = ServerConfig::from_env().expect("parse config");
+        assert_eq!(config.cleanup_interval_sec, 300); // 5 minutes default
+
+        // Test custom value
+        std::env::set_var("STACK_CLEANUP_INTERVAL_SEC", "60");
+        let config = ServerConfig::from_env().expect("parse config");
+        assert_eq!(config.cleanup_interval_sec, 60);
+
+        // Test zero disables cleanup
+        std::env::set_var("STACK_CLEANUP_INTERVAL_SEC", "0");
+        let config = ServerConfig::from_env().expect("parse config");
+        assert_eq!(config.cleanup_interval_sec, 0);
+
+        // Cleanup: unset env var
+        std::env::remove_var("STACK_CLEANUP_INTERVAL_SEC");
     }
 }
